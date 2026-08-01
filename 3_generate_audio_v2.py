@@ -353,7 +353,7 @@ def format_eta(
     )
     return (
         f"{format_duration(remaining_seconds)} "
-        f"({format_local_time(arrival)})"
+        f"({arrival.strftime('%H:%M %Z')})"
     )
 
 
@@ -2005,22 +2005,10 @@ def process_unfinished_units(
         plan = plans[unit_id]
         row = units[unit_id]
 
-        now = local_now()
-        average_seconds = (
-            (time.perf_counter() - run_start) / attempted_count
-            if attempted_count
-            else None
-        )
-        run_remaining = len(selected_ids) - run_index + 1
-        overall_remaining = total_units - completed_running
-
         print(
             f"\n[{run_index:05d}/{len(selected_ids):05d}] "
-            f"Unit {format_unit_id(unit_id)} | complete "
-            f"{completed_running:,}/{total_units:,} | "
-            f"now {format_local_time(now)} | "
-            f"run ETA {format_eta(average_seconds, run_remaining, now)} | "
-            f"full ETA {format_eta(average_seconds, overall_remaining, now)}",
+            f"Unit {format_unit_id(unit_id)} | "
+            f"{completed_running:,}/{total_units:,} complete",
             flush=True,
         )
 
@@ -2052,11 +2040,10 @@ def process_unfinished_units(
                 tts_cache,
                 result=result,
             )
+            now = local_now()
             print(
-                f"  OK in {elapsed:.1f}s | body "
-                f"{result['body_duration_ms'] / 1000:.1f}s | "
-                f"TTS new {tts_cache.generated_count:,}, "
-                f"cache reused {tts_cache.reused_count:,}"
+                f"  OK in {elapsed:.1f}s | "
+                f"{format_local_time(now)}"
             )
         except Exception as error:
             elapsed = time.perf_counter() - unit_start
@@ -2093,14 +2080,13 @@ def process_unfinished_units(
         elapsed_total = time.perf_counter() - run_start
         average_seconds = elapsed_total / attempted_count
         remaining_after = total_units - completed_running
-        run_remaining_after = len(selected_ids) - run_index
         now = local_now()
+        
         print(
-            f"  Progress: {completed_running:,} complete | "
-            f"{remaining_after:,} remaining | elapsed "
-            f"{format_duration(elapsed_total)} | "
-            f"run ETA {format_eta(average_seconds, run_remaining_after, now)} "
-            f"| full ETA {format_eta(average_seconds, remaining_after, now)}"
+            f"  Progress: {completed_running:,}/{total_units:,} complete | "
+            f"{remaining_after:,} left | "
+            f"elapsed {format_duration(elapsed_total)} | "
+            f"ETA {format_eta(average_seconds, remaining_after, now)}"
         )
 
         if consecutive_failures >= STOP_AFTER_CONSECUTIVE_FAILURES:
