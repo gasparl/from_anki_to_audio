@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ANKI CONTENT EXTRACTOR
+ANKI CONTENT EXTRACTOR V3
 
 Reads an Anki .apkg deck and creates one compact JSON file containing only
 the material needed for the later AI sentence-generation step.
@@ -37,18 +37,18 @@ import zipfile
 from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 
-SCRIPT_VERSION = "2.2-V2-SPYDER"
+SCRIPT_VERSION = "3.0-SPYDER"
 
 
 # ===================== CONFIGURATION =====================
 
 # Put the APKG in the same folder as this script, or enter an absolute path.
 INPUT_FILE = "Base.apkg"
-OUTPUT_ROOT_DIR_NAME = "anki_audio_output_v2"
-OUTPUT_FILE = "anki_content_v2.json"
+OUTPUT_ROOT_DIR_NAME = "anki_audio_output_v3"
+OUTPUT_FILE = "anki_content_v3.json"
 
 # True: resolve relative paths beside this script.
 # False: resolve relative paths from Spyder's current working directory.
@@ -95,7 +95,7 @@ def resolve_input_path(value: str) -> Path:
 
 
 def get_output_root() -> Path:
-    """Return the single folder used by all three V2 pipeline scripts."""
+    """Return the single folder used by all three V3 pipeline scripts."""
     return get_base_dir() / OUTPUT_ROOT_DIR_NAME
 
 
@@ -492,7 +492,7 @@ def save_results(
     """Save one readable JSON file for the next pipeline stage."""
     output = {
         "metadata": {
-            "schema_version": 2,
+            "schema_version": 3,
             "source_file": input_path.name,
             "collection_member": collection_member,
             "total_notes": len(notes),
@@ -560,14 +560,14 @@ def print_summary(notes: List[Dict[str, object]], output_path: Path) -> None:
             if note["example_english"]:
                 print(f"  EN example:  {note['example_english']}")
 
-    print("\nThe JSON is ready for the V2 AI-generation script.")
+    print("\nThe JSON is ready for the V3 AI-generation script.")
     print("=" * 60)
 
 
 def main() -> bool:
     """Main function, designed for direct execution in Spyder."""
     print("=" * 60)
-    print("ANKI CONTENT EXTRACTOR")
+    print("ANKI CONTENT EXTRACTOR V3")
     print(f"Version: {SCRIPT_VERSION} (no command-line arguments required)")
     print("=" * 60)
 

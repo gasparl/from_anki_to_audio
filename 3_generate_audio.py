@@ -1,29 +1,35 @@
 #!/usr/bin/env python3
 """
-ANKI JAPANESE AUDIO-LEARNING GENERATOR V2
+ANKI JAPANESE AUDIO-LEARNING GENERATOR V3
 
-Reads ``translated_output_v2.json`` and creates resumable Japanese-first audio
-plus one or more chaptered M4B audiobooks.
+Reads ``translated_output_v3.json`` and creates resumable Japanese-first audio,
+one or more chaptered M4B audiobooks, and a phone-friendly HTML text companion
+beside every finished M4B.
 
 Each learning unit becomes exactly one M4B chapter with this sequence:
 
   1. Playback number spoken naturally in Japanese with 番目
-  2. Japanese sentence: slow male, then slow female
+  2. Japanese sentence: slow Edge voices
   3. Close-structure English translation
-  4. Japanese sentence: moderately slow male, then moderately slow female
+  4. Japanese sentence: moderately paced Edge voices
 
 There are no explanations, breakdowns, or separate literal translations.
 
+Edge TTS is used for Japanese and English. The two available Japanese neural
+voices rotate deterministically, so reruns and resumes produce the same plan.
+
 The Japanese/English body parts are generated and saved per immutable unit ID,
-so TTS work remains resumable while a run is incomplete. Final playback order is
-a deterministic shuffle. The spoken number follows that shuffled playback
+so TTS work remains resumable while a run is incomplete. Final playback order
+is a deterministic shuffle. The spoken number follows that shuffled playback
 position rather than the internal unit ID. Completed units are packed into
 approximately seven-hour M4B volumes, with an eight-hour ceiling where normal
 unit boundaries permit it. Every volume contains whole units only. After all
-M4Bs verify successfully, temporary MP3/cache/build files are deleted.
+M4Bs and HTML companions verify successfully, temporary MP3/cache/build files
+are deleted.
 
 Designed for direct execution in Spyder:
-  1. Put this script beside ``translated_output_v2.json``.
+  1. Keep this script beside the other V3 scripts. It reads
+     ``anki_audio_output_v3/translated_output_v3.json``.
   2. Set UNIT_LIMIT to 5 or 20 for a limited test, or None for all unfinished
      units.
   3. Press Run. Progress is saved after every unit and resumes automatically.
@@ -32,10 +38,12 @@ Requirements:
     pip install edge-tts pydub
 
 FFmpeg and FFprobe must be installed and available on PATH.
+
 """
 
 import asyncio
 import hashlib
+import html
 import json
 import math
 import os
@@ -61,8 +69,7 @@ try:
 except ImportError:
     edge_tts = None
 
-
-SCRIPT_VERSION = "2.1-MULTI-M4B-SPYDER"
+SCRIPT_VERSION = "3.1-EDGE-JA-HTML-M4B-SPYDER"
 
 
 # ===================== ONLY USER SETTING =====================
@@ -71,17 +78,24 @@ SCRIPT_VERSION = "2.1-MULTI-M4B-SPYDER"
 # 5 or 20 = process only the next 5 or 20 unfinished units this run.
 UNIT_LIMIT = None
 
+# Edge currently exposes two Japanese neural voices. Each sentence uses them in
+# a deterministic alternating order. To prioritize one familiar voice, replace
+# the tuple with, for example, ("ja-JP-NanamiNeural",).
+JAPANESE_VOICES = (
+    "ja-JP-KeitaNeural",
+    "ja-JP-NanamiNeural",
+)
+
 # Changing this creates a different deterministic playback order. It does not
 # invalidate generated unit body audio; it only rebuilds audiobook layout.
 SHUFFLE_SEED = 20260731
 
 # ===================== FIXED INTERNAL SETTINGS =====================
 
-OUTPUT_ROOT_DIR_NAME = "anki_audio_output_v2"
-INPUT_JSON = "translated_output_v2.json"
-CONFIG_FILE = "config.json"  # Kept for pipeline consistency; not read.
-PROGRESS_FILE = "audio_progress_v2.json"
-MANIFEST_FILE = "audio_manifest_v2.json"
+OUTPUT_ROOT_DIR_NAME = "anki_audio_output_v3"
+INPUT_JSON = "translated_output_v3.json"
+PROGRESS_FILE = "audio_progress_v3.json"
+MANIFEST_FILE = "audio_manifest_v3.json"
 
 # All intermediate audio is isolated in one disposable work folder. It remains
 # during partial runs for resumability and is removed after verified M4B output.
@@ -91,8 +105,13 @@ BUILD_TEMP_AUDIO_DIR_NAME = "assembly"
 UNIT_AUDIO_DIR_NAME = "unit_parts"
 UNIT_NUMBER_AUDIO_DIR_NAME = "number_parts"
 AUDIOBOOK_OUTPUT_DIR_NAME = "."  # Final M4Bs live directly in the output root.
-AUDIOBOOK_BASENAME = "japanese_audio_learning_v2"
-AUDIOBOOK_TITLE = "Japanese Audio Learning"
+AUDIOBOOK_BASENAME = "japanese_audio_learning_v3"
+now = datetime.now().astimezone()
+AUDIOBOOK_TITLE = (
+    f"アンキ発日本語リスニング・"
+    f"{now.year}年{now.month}月{now.day}日"
+)
+HTML_COMPANION_VERSION = 1
 
 # Pauses preserve the intent of the older generator.
 PAUSE_IN_INITIAL_JAPANESE_MS = 1300
@@ -100,20 +119,33 @@ PAUSE_AFTER_INITIAL_JAPANESE_MS = 1600
 PAUSE_IN_FINAL_JAPANESE_MS = 800
 PAUSE_END_SILENCE_MS = 900
 
-# edge-tts rates and voices remain close to the previous implementation.
+# Edge rates retain the natural timing of the original generator.
 JA_RATE_UNIT_NUMBER = "+0%"
 JA_RATE_JAPANESE_SLOW = "-30%"
 JA_RATE_JAPANESE_FINAL = "-10%"
 EN_RATE = "+0%"
 
-JAPANESE_MALE_VOICE = "ja-JP-KeitaNeural"
-JAPANESE_FEMALE_VOICE = "ja-JP-NanamiNeural"
+JAPANESE_NUMBER_MALE_VOICE = "ja-JP-KeitaNeural"
+JAPANESE_NUMBER_FEMALE_VOICE = "ja-JP-NanamiNeural"
 ENGLISH_MALE_VOICE = "en-US-SteffanNeural"
 
+JAPANESE_VOICE_KEYS = tuple(
+    f"ja_edge_{index + 1}" for index in range(len(JAPANESE_VOICES))
+)
 VOICE_MAP = {
-    "ja_male": JAPANESE_MALE_VOICE,
-    "ja_female": JAPANESE_FEMALE_VOICE,
-    "en_male": ENGLISH_MALE_VOICE,
+    **{
+        key: {"provider": "edge-tts", "voice": voice}
+        for key, voice in zip(JAPANESE_VOICE_KEYS, JAPANESE_VOICES)
+    },
+    "ja_number_male": {
+        "provider": "edge-tts",
+        "voice": JAPANESE_NUMBER_MALE_VOICE,
+    },
+    "ja_number_female": {
+        "provider": "edge-tts",
+        "voice": JAPANESE_NUMBER_FEMALE_VOICE,
+    },
+    "en_male": {"provider": "edge-tts", "voice": ENGLISH_MALE_VOICE},
 }
 
 # Durable intermediate MP3 settings.
@@ -125,7 +157,7 @@ NORMALIZE_HEADROOM_DB = 1.0
 MIN_MP3_BYTES = 120
 MIN_AUDIO_DURATION_MS = 40
 
-# Final M4B encoding: a balanced speech setting for Edge TTS material.
+# Final M4B encoding: a balanced speech setting for spoken learning material.
 AUDIOBOOK_AAC_CODEC = "aac"
 AUDIOBOOK_AAC_PROFILE = "aac_low"
 AUDIOBOOK_AAC_BITRATE = "80k"
@@ -174,7 +206,6 @@ def get_base_dir() -> Path:
 BASE_DIR = get_base_dir()
 OUTPUT_ROOT_DIR = BASE_DIR / OUTPUT_ROOT_DIR_NAME
 INPUT_JSON_PATH = OUTPUT_ROOT_DIR / INPUT_JSON
-CONFIG_PATH = BASE_DIR / CONFIG_FILE
 PROGRESS_PATH = OUTPUT_ROOT_DIR / PROGRESS_FILE
 MANIFEST_PATH = OUTPUT_ROOT_DIR / MANIFEST_FILE
 WORK_DIR = OUTPUT_ROOT_DIR / WORK_DIR_NAME
@@ -362,7 +393,7 @@ def format_unit_id(unit_id: str) -> str:
 
 
 def validate_and_load_input(path: Path) -> Tuple[Dict[str, Dict], List[str]]:
-    """Load translated_output_v2.json and validate its audio-facing schema."""
+    """Load translated_output_v3.json and validate its audio-facing schema."""
     if not path.exists():
         raise FileNotFoundError(f"Input file not found: {path}")
 
@@ -377,7 +408,7 @@ def validate_and_load_input(path: Path) -> Tuple[Dict[str, Dict], List[str]]:
         status = str(metadata.get("status", "")).strip().casefold()
         if status and status != "complete":
             raise ValueError(
-                "translated_output_v2.json is partial. Complete the V2 "
+                "translated_output_v3.json is partial. Complete the V3 "
                 "content-generation run before starting audio, otherwise "
                 "the input hash and unit set would change during resume."
             )
@@ -462,14 +493,28 @@ def component(
     rate: str,
     pause_after_ms: int = 0,
 ) -> Dict:
+    voice = VOICE_MAP[voice_key]
     return {
         "text": clean_text(text),
         "language": language,
         "voice_key": voice_key,
-        "voice": VOICE_MAP[voice_key],
+        "provider": voice["provider"],
+        "voice": voice["voice"],
         "rate": rate,
         "pause_after_ms": int(pause_after_ms),
     }
+
+
+def japanese_voice_keys_for_unit(unit_id: str) -> List[str]:
+    """Rotate the configured Edge voices reproducibly for one unit."""
+    if not JAPANESE_VOICE_KEYS:
+        raise ValueError("JAPANESE_VOICES must contain at least one voice")
+    digest = hashlib.sha256(f"edge-voices:{unit_id}".encode("utf-8")).digest()
+    offset = int.from_bytes(digest[:4], "big") % len(JAPANESE_VOICE_KEYS)
+    return [
+        JAPANESE_VOICE_KEYS[(offset + index) % len(JAPANESE_VOICE_KEYS)]
+        for index in range(4)
+    ]
 
 
 def build_unit_plan(unit_id: str, row: Dict) -> Dict:
@@ -477,26 +522,25 @@ def build_unit_plan(unit_id: str, row: Dict) -> Dict:
     padded = format_unit_id(unit_id)
     japanese = clean_text(row["japanese"])
     english = clean_text(row["english"])
+    japanese_voice_keys = japanese_voice_keys_for_unit(unit_id)
 
     parts = [
         {
             "number": 2,
-            "name": "japanese_slow_male_female",
-            "output_file": (
-                f"unit_{padded}_2_japanese_slow_male_female.mp3"
-            ),
+            "name": "japanese_slow_varied_voices",
+            "output_file": f"unit_{padded}_2_japanese_slow_varied.mp3",
             "components": [
                 component(
                     japanese,
                     "ja",
-                    "ja_male",
+                    japanese_voice_keys[0],
                     JA_RATE_JAPANESE_SLOW,
                     pause_after_ms=PAUSE_IN_INITIAL_JAPANESE_MS,
                 ),
                 component(
                     japanese,
                     "ja",
-                    "ja_female",
+                    japanese_voice_keys[1],
                     JA_RATE_JAPANESE_SLOW,
                 ),
             ],
@@ -511,22 +555,20 @@ def build_unit_plan(unit_id: str, row: Dict) -> Dict:
         },
         {
             "number": 4,
-            "name": "japanese_final_male_female",
-            "output_file": (
-                f"unit_{padded}_4_japanese_final_male_female.mp3"
-            ),
+            "name": "japanese_final_varied_voices",
+            "output_file": f"unit_{padded}_4_japanese_final_varied.mp3",
             "components": [
                 component(
                     japanese,
                     "ja",
-                    "ja_male",
+                    japanese_voice_keys[2],
                     JA_RATE_JAPANESE_FINAL,
                     pause_after_ms=PAUSE_IN_FINAL_JAPANESE_MS,
                 ),
                 component(
                     japanese,
                     "ja",
-                    "ja_female",
+                    japanese_voice_keys[3],
                     JA_RATE_JAPANESE_FINAL,
                 ),
             ],
@@ -552,7 +594,11 @@ def build_unit_plan(unit_id: str, row: Dict) -> Dict:
 
 def unit_number_voice_key(playback_number: int) -> str:
     digest = hashlib.sha256(str(playback_number).encode("utf-8")).digest()
-    return "ja_male" if digest[0] % 2 == 0 else "ja_female"
+    return (
+        "ja_number_male"
+        if digest[0] % 2 == 0
+        else "ja_number_female"
+    )
 
 
 def spoken_unit_number(playback_number: int) -> str:
@@ -604,9 +650,9 @@ def progress_settings() -> Dict:
             "normalization_headroom_db": NORMALIZE_HEADROOM_DB,
         },
         "unit_body_sequence": [
-            "japanese_slow_male_female",
+            "japanese_slow_varied_voices",
             "english_close_translation",
-            "japanese_final_male_female",
+            "japanese_final_varied_voices",
         ],
     }
 
@@ -627,13 +673,17 @@ def audiobook_settings() -> Dict:
         "target_volume_hours": TARGET_VOLUME_HOURS,
         "maximum_volume_hours": MAX_VOLUME_HOURS,
         "numbering": "global shuffled playback position spoken with 番目",
+        "html_companion": {
+            "version": HTML_COMPANION_VERSION,
+            "format": "self-contained searchable text index per volume",
+        },
         "title": AUDIOBOOK_TITLE,
     }
 
 
 def new_progress(input_hash: str, total_units: int) -> Dict:
     return {
-        "version": 2,
+        "version": 3,
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "input_sha256": input_hash,
@@ -657,17 +707,17 @@ def load_or_create_progress(
 
     if progress.get("input_sha256") != input_hash:
         raise ValueError(
-            "The V2 audio progress file belongs to different input data. "
-            "Rename the V2 progress, manifest, and output folders before "
+            "The V3 audio progress file belongs to different input data. "
+            "Rename the V3 progress, manifest, and output folders before "
             "starting audio for changed content."
         )
     if progress.get("settings") != progress_settings():
         raise ValueError(
-            "Unit body audio settings changed since V2 progress was created. "
-            "Restore the settings or rename the V2 progress/output files."
+            "Unit body audio settings changed since V3 progress was created. "
+            "Restore the settings or rename the V3 progress/output files."
         )
     if int(progress.get("total_units", 0)) != total_units:
-        raise ValueError("The unit count no longer matches V2 audio progress")
+        raise ValueError("The unit count no longer matches V3 audio progress")
 
     progress.setdefault("completed_units", {})
     progress.setdefault("failed_units", {})
@@ -676,7 +726,7 @@ def load_or_create_progress(
 
 def new_manifest(input_hash: str) -> Dict:
     return {
-        "version": 2,
+        "version": 3,
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "input_sha256": input_hash,
@@ -711,44 +761,41 @@ def load_or_create_manifest(path: Path, input_hash: str) -> Dict:
 class EdgeTTSProvider:
     name = "edge-tts"
 
+    def __init__(self) -> None:
+        self.last_error = ""
+
     async def _generate_async(
         self,
-        text: str,
+        item: Dict,
         output_file: Path,
-        voice_name: str,
-        rate: str,
     ) -> bool:
         try:
             communicate = edge_tts.Communicate(
-                text=text,
-                voice=voice_name,
-                rate=rate,
+                text=item["text"],
+                voice=item["voice"],
+                rate=item["rate"],
             )
             await communicate.save(str(output_file))
             return audio_file_is_valid(output_file)
-        except Exception:
+        except Exception as error:
+            self.last_error = f"{type(error).__name__}: {error}"
             return False
 
     def generate(
         self,
-        text: str,
+        item: Dict,
         output_file: Path,
-        voice_name: str,
-        rate: str,
     ) -> bool:
+        self.last_error = ""
         result = {"ok": False}
 
         def runner() -> None:
             try:
                 result["ok"] = asyncio.run(
-                    self._generate_async(
-                        text,
-                        output_file,
-                        voice_name,
-                        rate,
-                    )
+                    self._generate_async(item, output_file)
                 )
-            except Exception:
+            except Exception as error:
+                self.last_error = f"{type(error).__name__}: {error}"
                 result["ok"] = False
 
         thread = threading.Thread(target=runner)
@@ -758,7 +805,7 @@ class EdgeTTSProvider:
 
 
 class TTSCache:
-    """Content-addressed cache shared safely with the previous generator."""
+    """Content-addressed Edge TTS cache."""
 
     def __init__(self, cache_dir: Path, provider) -> None:
         self.cache_dir = cache_dir
@@ -768,12 +815,13 @@ class TTSCache:
         self.reused_count = 0
 
     def cache_spec(self, item: Dict) -> Dict:
-        return {
-            "provider": self.provider.name,
+        spec = {
+            "provider": item["provider"],
             "text": item["text"],
             "voice": item["voice"],
             "rate": item["rate"],
         }
+        return spec
 
     def cache_key(self, item: Dict) -> str:
         return sha256_json(self.cache_spec(item))
@@ -796,12 +844,7 @@ class TTSCache:
 
         for attempt in range(1, MAX_TTS_RETRIES + 1):
             safe_unlink(raw_path)
-            ok = self.provider.generate(
-                item["text"],
-                raw_path,
-                item["voice"],
-                item["rate"],
-            )
+            ok = self.provider.generate(item, raw_path)
             if ok and audio_file_is_valid(raw_path, decode=True):
                 os.replace(str(raw_path), str(cache_path))
                 self.generated_count += 1
@@ -815,9 +858,11 @@ class TTSCache:
                 time.sleep(sleep_seconds)
 
         safe_unlink(raw_path)
+        detail = str(getattr(self.provider, "last_error", "")).strip()
         raise RuntimeError(
             "TTS failed after retries for voice "
             f"{item['voice']}: {item['text'][:120]}"
+            + (f" | {detail}" if detail else "")
         )
 
 
@@ -985,6 +1030,7 @@ def compact_plan_for_manifest(plan: Dict, tts_cache: TTSCache) -> List[Dict]:
             components.append(
                 {
                     "language": item["language"],
+                    "provider": item["provider"],
                     "voice": item["voice"],
                     "rate": item["rate"],
                     "text": item["text"],
@@ -1212,7 +1258,9 @@ def build_chapter_entries(
             {
                 "playback_number": playback_number,
                 "unit_id": unit_id,
-                "title": f"Unit {playback_number:05d}",
+                "title": f"例文{playback_number:05d}",
+                "japanese": row["japanese"],
+                "english": row["english"],
                 "primary_source_note_number": row[
                     "primary_source_note_number"
                 ],
@@ -1347,8 +1395,8 @@ def build_volume_plan(
         f"{AUDIOBOOK_BASENAME}_{volume_number:0{width}d}.m4b"
     )
     volume_title = (
-        f"{AUDIOBOOK_TITLE} — Volume {volume_number:0{width}d} "
-        f"of {total_volumes:0{width}d}"
+        f"{AUDIOBOOK_TITLE}・"
+        f"第{volume_number}巻（全{total_volumes}巻）"
     )
     fingerprint = {
         "input_sha256": input_hash,
@@ -1381,6 +1429,202 @@ def build_volume_plan(
         "chapters": planned_chapters,
         "total_duration_ms": cursor_ms,
         "settings": audiobook_settings(),
+    }
+
+
+def format_chapter_time(milliseconds: int) -> str:
+    total_seconds = max(0, int(milliseconds) // 1000)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def html_companion_text(volume_plan: Dict) -> str:
+    """Return a self-contained, searchable mobile companion page."""
+    title = html.escape(str(volume_plan["title"]))
+    audio_file = html.escape(str(volume_plan["file_name"]), quote=True)
+    chapters = volume_plan["chapters"]
+    first_number = int(chapters[0]["playback_number"])
+    last_number = int(chapters[-1]["playback_number"])
+    duration = format_duration(volume_plan["total_duration_ms"] / 1000)
+
+    cards: List[str] = []
+    for chapter in chapters:
+        number = int(chapter["playback_number"])
+        japanese = str(chapter["japanese"])
+        english_text = str(chapter["english"])
+        primary = int(chapter["primary_source_note_number"])
+        supporting = [
+            int(value)
+            for value in chapter.get("supporting_source_note_numbers", [])
+        ]
+        source_text = f"Source note {primary}"
+        if supporting:
+            source_text += "; supporting " + ", ".join(
+                str(value) for value in supporting
+            )
+        search_text = f"{number} {japanese} {english_text}".casefold()
+        cards.append(
+            "\n".join(
+                [
+                    (
+                        f'<article class="sentence" id="sentence-{number:05d}" '
+                        f'data-number="{number}" '
+                        f'data-search="{html.escape(search_text, quote=True)}">'
+                    ),
+                    '  <div class="sentence-meta">',
+                    (
+                        f'    <a href="#sentence-{number:05d}">'
+                        f'#{number:05d}</a>'
+                    ),
+                    (
+                        "    <span>"
+                        + format_chapter_time(int(chapter["start_ms"]))
+                        + "</span>"
+                    ),
+                    f"    <span>{html.escape(source_text)}</span>",
+                    "  </div>",
+                    (
+                        '  <p class="japanese" lang="ja">'
+                        + html.escape(japanese)
+                        + "</p>"
+                    ),
+                    (
+                        '  <p class="english" lang="en">'
+                        + html.escape(english_text)
+                        + "</p>"
+                    ),
+                    "</article>",
+                ]
+            )
+        )
+
+    document_start = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>__TITLE__ — Text companion</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, -apple-system,
+      "Segoe UI", sans-serif; --bg: #f5f6f8; --card: #fff; --text: #17202a;
+      --muted: #68717d; --line: #d9dde3; --accent: #315dca; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #101318; --card: #191e26; --text: #edf1f7;
+        --muted: #a9b2bf; --line: #343c48; --accent: #91b2ff; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); }
+    header { position: sticky; top: 0; z-index: 2; padding: 1rem;
+      background: var(--bg);
+      background: color-mix(in srgb, var(--bg) 92%, transparent);
+      border-bottom: 1px solid var(--line); backdrop-filter: blur(12px); }
+    .header-inner, main { width: min(52rem, 100%); margin: auto; }
+    h1 { margin: 0 0 .35rem; font-size: clamp(1.1rem, 4vw, 1.5rem); }
+    .summary { margin: 0 0 .75rem; color: var(--muted); font-size: .9rem; }
+    .tools { display: grid; grid-template-columns: 1fr auto; gap: .55rem; }
+    input, button { min-height: 2.75rem; border: 1px solid var(--line);
+      border-radius: .7rem; font: inherit; }
+    input { width: 100%; padding: .65rem .8rem; background: var(--card);
+      color: var(--text); }
+    button { padding: .55rem .85rem; background: var(--accent); color: white;
+      border-color: transparent; }
+    #result { min-height: 1.2rem; margin: .45rem 0 0; color: var(--muted);
+      font-size: .85rem; }
+    main { padding: .8rem; }
+    .sentence { scroll-margin-top: 10rem; margin: 0 0 .75rem; padding: 1rem;
+      border: 1px solid var(--line); border-radius: .9rem;
+      background: var(--card); box-shadow: 0 1px 2px rgb(0 0 0 / .05); }
+    .sentence:target { outline: 3px solid var(--accent); }
+    .sentence-meta { display: flex; flex-wrap: wrap; gap: .45rem .8rem;
+      color: var(--muted); font-size: .8rem; }
+    .sentence-meta a, .audio-link { color: var(--accent); font-weight: 700; }
+    .japanese { margin: .65rem 0 .4rem; font-family: "Hiragino Sans",
+      "Yu Gothic", "Noto Sans JP", sans-serif; font-size: 1.35rem;
+      line-height: 1.65; }
+    .english { margin: 0; color: var(--muted); font-size: 1rem;
+      line-height: 1.5; }
+    [hidden] { display: none !important; }
+    noscript { display: block; margin-top: .5rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <h1>__TITLE__</h1>
+      <p class="summary">Sentences __FIRST__–__LAST__ · __COUNT__ chapters ·
+        __DURATION__ · <a class="audio-link" href="__AUDIO__">open M4B</a></p>
+      <div class="tools">
+        <input id="search" type="search" inputmode="search"
+          placeholder="Sentence number, Japanese, or English"
+          aria-label="Filter sentences">
+        <button id="clear" type="button">Clear</button>
+      </div>
+      <p id="result" aria-live="polite">__COUNT__ sentences</p>
+      <noscript>Search requires JavaScript; the complete list is below.</noscript>
+    </div>
+  </header>
+  <main id="sentences">
+"""
+    document_start = (
+        document_start.replace("__TITLE__", title)
+        .replace("__FIRST__", f"{first_number:05d}")
+        .replace("__LAST__", f"{last_number:05d}")
+        .replace("__COUNT__", f"{len(chapters):,}")
+        .replace("__DURATION__", html.escape(duration))
+        .replace("__AUDIO__", audio_file)
+    )
+    document_end = """  </main>
+  <script>
+    const search = document.getElementById("search");
+    const clear = document.getElementById("clear");
+    const result = document.getElementById("result");
+    const cards = [...document.querySelectorAll(".sentence")];
+    function applyFilter() {
+      const query = search.value.trim().toLocaleLowerCase();
+      const numeric = /^#?\\d+$/.test(query) ? query.replace("#", "") : null;
+      let visible = 0;
+      for (const card of cards) {
+        const match = !query || (numeric !== null
+          ? card.dataset.number === String(Number(numeric))
+          : card.dataset.search.toLocaleLowerCase().includes(query));
+        card.hidden = !match;
+        if (match) visible += 1;
+      }
+      result.textContent = `${visible.toLocaleString()} sentence${visible === 1 ? "" : "s"}`;
+      if (numeric !== null && visible === 1) {
+        const target = cards.find(card => !card.hidden);
+        if (target) target.scrollIntoView({ block: "center" });
+      }
+    }
+    search.addEventListener("input", applyFilter);
+    clear.addEventListener("click", () => {
+      search.value = "";
+      applyFilter();
+      search.focus();
+    });
+  </script>
+</body>
+</html>
+"""
+    return document_start + "\n".join(cards) + "\n" + document_end
+
+
+def write_html_companion(volume_plan: Dict) -> Dict:
+    output_path = Path(volume_plan["output_path"]).with_suffix(".html")
+    content = html_companion_text(volume_plan)
+    atomic_write_text(output_path, content)
+    return {
+        "version": HTML_COMPANION_VERSION,
+        "file": output_path.name,
+        "relative_path": str(
+            Path(OUTPUT_ROOT_DIR_NAME)
+            / AUDIOBOOK_OUTPUT_DIR_NAME
+            / output_path.name
+        ),
+        "size_bytes": output_path.stat().st_size,
+        "sha256": sha256_file(output_path),
     }
 
 
@@ -1685,17 +1929,21 @@ def create_or_reuse_volume(
         safe_unlink(metadata_path)
 
 
-def remove_stale_audiobooks(expected_files: Sequence[str]) -> int:
+def remove_stale_audiobook_outputs(expected_files: Sequence[str]) -> int:
     expected = set(expected_files)
+    expected.update(str(Path(name).with_suffix(".html")) for name in expected_files)
     removed = 0
-    for path in AUDIOBOOK_OUTPUT_DIR.glob(f"{AUDIOBOOK_BASENAME}_*.m4b"):
-        if path.name in expected:
-            continue
-        try:
-            path.unlink()
-            removed += 1
-        except Exception:
-            pass
+    for suffix in ("m4b", "html"):
+        for path in AUDIOBOOK_OUTPUT_DIR.glob(
+            f"{AUDIOBOOK_BASENAME}_*.{suffix}"
+        ):
+            if path.name in expected:
+                continue
+            try:
+                path.unlink()
+                removed += 1
+            except Exception:
+                pass
     return removed
 
 
@@ -1771,11 +2019,13 @@ def assemble_m4b_volumes(
             plan,
             saved_volumes.get(str(volume_number), {}),
         )
+        entry["html_companion"] = write_html_companion(plan)
         output_entries.append(entry)
         print(
             f"  {entry['result'].capitalize()}: {entry['file']} | "
             f"{entry['size_bytes'] / (1024 * 1024):.1f} MiB"
         )
+        print(f"  Text companion: {entry['html_companion']['file']}")
 
         manifest["audiobooks"] = {
             "status": "building",
@@ -1789,7 +2039,7 @@ def assemble_m4b_volumes(
         }
         save_progress_and_manifest(progress, manifest)
 
-    removed_stale = remove_stale_audiobooks(
+    removed_stale = remove_stale_audiobook_outputs(
         [plan["file_name"] for plan in volume_plans]
     )
     manifest["audiobooks"] = {
@@ -1862,7 +2112,7 @@ def verify_saved_audiobooks(
     manifest: Dict,
     total_units: int,
 ) -> Tuple[bool, str, Optional[Dict]]:
-    """Validate final M4Bs without requiring deleted intermediate MP3 files."""
+    """Validate final M4Bs and HTML without deleted intermediate MP3 files."""
     root = manifest.get("audiobooks", {})
     if not isinstance(root, dict) or root.get("status") != "complete":
         return False, "manifest has no complete audiobook build", None
@@ -1922,6 +2172,33 @@ def verify_saved_audiobooks(
         if len(probe.get("chapters", [])) != int(entry.get("chapter_count", -1)):
             return False, f"chapter count mismatch in {filename}", None
 
+        companion = entry.get("html_companion", {})
+        if not isinstance(companion, dict):
+            return False, f"HTML companion metadata missing for {filename}", None
+        try:
+            companion_version = int(companion.get("version", 0))
+        except (TypeError, ValueError):
+            companion_version = 0
+        if companion_version != HTML_COMPANION_VERSION:
+            return False, f"HTML companion version differs for {filename}", None
+        companion_name = str(companion.get("file", "")).strip()
+        expected_name = Path(filename).with_suffix(".html").name
+        if companion_name != expected_name:
+            return False, f"HTML companion filename differs for {filename}", None
+        companion_path = AUDIOBOOK_OUTPUT_DIR / companion_name
+        if not companion_path.exists() or not companion_path.is_file():
+            return False, f"missing HTML companion: {companion_name}", None
+        try:
+            if companion_path.stat().st_size != int(
+                companion.get("size_bytes", -1)
+            ):
+                return False, f"size mismatch for {companion_name}", None
+        except (TypeError, ValueError):
+            return False, f"invalid saved size for {companion_name}", None
+        companion_hash = str(companion.get("sha256", ""))
+        if not companion_hash or sha256_file(companion_path) != companion_hash:
+            return False, f"checksum mismatch for {companion_name}", None
+
     return True, "", root
 
 
@@ -1938,6 +2215,15 @@ def validate_configuration() -> None:
         )
     if MAX_TTS_RETRIES < 1:
         raise ValueError("MAX_TTS_RETRIES must be at least 1")
+    if not JAPANESE_VOICES:
+        raise ValueError("JAPANESE_VOICES must contain at least one voice")
+    if any(
+        not isinstance(voice, str) or not voice.strip()
+        for voice in JAPANESE_VOICES
+    ):
+        raise ValueError("Every JAPANESE_VOICES entry must be a non-empty name")
+    if len(set(JAPANESE_VOICES)) != len(JAPANESE_VOICES):
+        raise ValueError("JAPANESE_VOICES must not contain duplicates")
 
 
 def validate_runtime_dependencies(require_edge_tts: bool = True) -> None:
@@ -2081,7 +2367,6 @@ def process_unfinished_units(
         average_seconds = elapsed_total / attempted_count
         remaining_after = total_units - completed_running
         now = local_now()
-        
         print(
             f"  Progress: {completed_running:,}/{total_units:,} complete | "
             f"{remaining_after:,} left | "
@@ -2111,13 +2396,15 @@ def process_unfinished_units(
 
 def main() -> bool:
     print("=" * 72)
-    print("ANKI JAPANESE AUDIO-LEARNING GENERATOR V2")
-    print(f"Version: {SCRIPT_VERSION} | edge-tts | multi-volume M4B")
+    print("ANKI JAPANESE AUDIO-LEARNING GENERATOR V3")
+    print(
+        f"Version: {SCRIPT_VERSION} | Edge Japanese + Edge English | "
+        "M4B + HTML"
+    )
     print("=" * 72)
 
     print(f"Output folder:     {OUTPUT_ROOT_DIR}")
     print(f"Input:             {INPUT_JSON_PATH}")
-    print(f"Config:            {CONFIG_PATH} (not required by edge-tts)")
     print(f"Progress:          {PROGRESS_PATH}")
     print(f"Manifest:          {MANIFEST_PATH}")
     print(f"Temporary work:    {WORK_DIR}")
@@ -2172,8 +2459,9 @@ def main() -> bool:
                 manifest["audiobooks"]["cleaned_bytes"] = cleanup_result["bytes"]
                 save_progress_and_manifest(progress, manifest)
 
-            print("\nExisting verified M4B output is already complete.")
+            print("\nExisting verified M4B and HTML output is already complete.")
             print(f"M4B volumes:        {saved_audiobooks['total_volumes']:,}")
+            print(f"HTML companions:    {saved_audiobooks['total_volumes']:,}")
             print(
                 "M4B duration:       "
                 + format_duration(saved_audiobooks["total_duration_ms"] / 1000)
@@ -2199,7 +2487,7 @@ def main() -> bool:
         save_progress_and_manifest(progress, manifest)
         if removed_obsolete:
             print(
-                f"Removed {removed_obsolete:,} obsolete V2 unit audio file(s)."
+                f"Removed {removed_obsolete:,} obsolete V3 unit audio file(s)."
             )
 
         print(f"\nLoaded {len(unit_ids):,} validated learning units.")
@@ -2208,18 +2496,19 @@ def main() -> bool:
             + ", ".join(format_unit_id(value) for value in unit_ids[:5])
             + (" ..." if len(unit_ids) > 5 else "")
         )
-        print("\nVoices and rates")
+        print("\nTTS voices and delivery")
         print(
-            f"  Japanese male:   {JAPANESE_MALE_VOICE} "
-            f"({JA_RATE_JAPANESE_SLOW} first; "
+            "  Japanese engine: Edge neural TTS "
+            f"({JA_RATE_JAPANESE_SLOW} slow; "
             f"{JA_RATE_JAPANESE_FINAL} final)"
         )
+        print(f"  Japanese voices: {', '.join(JAPANESE_VOICES)}")
         print(
-            f"  Japanese female: {JAPANESE_FEMALE_VOICE} "
-            f"({JA_RATE_JAPANESE_SLOW} first; "
-            f"{JA_RATE_JAPANESE_FINAL} final)"
+            "  Number voices:   "
+            f"{JAPANESE_NUMBER_MALE_VOICE}, "
+            f"{JAPANESE_NUMBER_FEMALE_VOICE} (Edge)"
         )
-        print(f"  English male:    {ENGLISH_MALE_VOICE} ({EN_RATE})")
+        print(f"  English voice:   {ENGLISH_MALE_VOICE} ({EN_RATE}, Edge)")
 
         run_result = process_unfinished_units(
             units=units,
@@ -2300,6 +2589,10 @@ def main() -> bool:
                 + format_duration(
                     audiobook_result["total_duration_ms"] / 1000
                 )
+            )
+            print(
+                f"HTML companions:    "
+                f"{audiobook_result['total_volumes']:,}"
             )
             print(f"M4B folder:         {AUDIOBOOK_OUTPUT_DIR}")
             if cleanup_result["files"]:

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-ANKI -> JAPANESE LEARNING CONTENT GENERATOR V2
+ANKI -> JAPANESE LEARNING CONTENT GENERATOR V3
 
-Reads ``anki_content_v2.json`` created by the V2 extraction script and uses
+Reads ``anki_content_v3.json`` created by the V3 extraction script and uses
 DeepSeek to generate fresh Japanese-English learning units.
 
 Each source note is the primary learning point for exactly two units. The model
@@ -22,9 +22,10 @@ literal translations. Each unit contains only:
   source_anki_note_ids            (added by this script)
 
 Designed for direct execution in Spyder:
-  1. Run the extractor first. It writes ``anki_content_v2.json`` into the
-     shared ``anki_audio_output_v2`` folder. Keep ``config.json`` beside this
-     script.
+  1. Run the extractor first. It writes ``anki_content_v3.json`` into the
+     shared ``anki_audio_output_v3`` folder. Keep ``config.json`` beside this
+     script. The same file can also hold the ``GEMINI_API_KEY`` used by the V3
+     audio script.
   2. Leave BATCH_LIMIT as None for the full run, or set it to 2 or 3 for a
      short resumable test.
   3. Press Run. Progress is saved after every batch.
@@ -51,7 +52,7 @@ except ImportError:
     requests = None
 
 
-SCRIPT_VERSION = "2.1-V2"
+SCRIPT_VERSION = "3.0"
 
 
 # ===================== ONLY USER SETTING =====================
@@ -62,10 +63,10 @@ BATCH_LIMIT = None
 
 # ===================== FIXED INTERNAL SETTINGS =====================
 
-OUTPUT_ROOT_DIR_NAME = "anki_audio_output_v2"
-INPUT_JSON = "anki_content_v2.json"
-OUTPUT_JSON = "translated_output_v2.json"
-PROGRESS_FILE = "generation_progress_v2.json"
+OUTPUT_ROOT_DIR_NAME = "anki_audio_output_v3"
+INPUT_JSON = "anki_content_v3.json"
+OUTPUT_JSON = "translated_output_v3.json"
+PROGRESS_FILE = "generation_progress_v3.json"
 CONFIG_FILE = "config.json"
 
 # True: resolve relative paths beside this script.
@@ -129,7 +130,7 @@ def resolve_script_path(value: str) -> Path:
 
 
 def get_output_root() -> Path:
-    """Return the single folder used by all three V2 pipeline scripts."""
+    """Return the single folder used by all three V3 pipeline scripts."""
     return get_base_dir() / OUTPUT_ROOT_DIR_NAME
 
 
@@ -220,12 +221,15 @@ class Config:
 
         print("ERROR: No DeepSeek API key was found.")
         print(f"Create {resolve_script_path(CONFIG_FILE)} containing:")
-        print('{"DEEPSEEK_API_KEY": "your-key-here"}')
+        print(
+            '{"DEEPSEEK_API_KEY": "your-key-here", '
+            '"GEMINI_API_KEY": "your-key-here"}'
+        )
         return False
 
 
 def load_input_notes(path: Path) -> List[Dict]:
-    """Load and validate the compact V2 extraction output."""
+    """Load and validate the compact V3 extraction output."""
     if not path.exists():
         raise FileNotFoundError(f"Input file not found: {path}")
 
@@ -334,7 +338,7 @@ def progress_settings() -> Dict:
 
 def new_progress(input_hash: str, total_batches: int) -> Dict:
     return {
-        "version": 2,
+        "version": 3,
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "input_sha256": input_hash,
@@ -358,19 +362,19 @@ def load_or_create_progress(
 
     if progress.get("input_sha256") != input_hash:
         raise ValueError(
-            "The V2 progress file belongs to different input data. "
+            "The V3 progress file belongs to different input data. "
             f"Delete or rename {path.name} to start a new run."
         )
 
     if progress.get("settings") != progress_settings():
         raise ValueError(
-            "V2 generation settings changed since progress was created. "
+            "V3 generation settings changed since progress was created. "
             f"Delete or rename {path.name} to start a new run."
         )
 
     if int(progress.get("total_batches", 0)) != total_batches:
         raise ValueError(
-            "The number of batches no longer matches the V2 progress file."
+            "The number of batches no longer matches the V3 progress file."
         )
 
     progress.setdefault("completed_batches", {})
@@ -399,18 +403,19 @@ def build_prompts(
 
 COVERAGE AND RECOMBINATION:
 1. Every allowed source note must be the primary_source_note_number in exactly {UNITS_PER_PRIMARY_NOTE} units.
-2. For the primary note, use its explanation to identify the exact grammar, meaning, contrast, restriction, or nuance the learner intended to practise. The main phrase alone may be ambiguous; do not guess a different target when the explanation clarifies it.
-3. Each unit must clearly practise its primary note, but should normally combine it with useful vocabulary or grammar from 0-{MAX_SUPPORTING_NOTES_PER_UNIT} other notes in this batch when the combination is natural.
-4. supporting_source_note_numbers must list only other notes genuinely used. Never repeat the primary note there.
-5. Create a new situation and wording. Do not copy the scenario of any old example sentence.
-6. Mix the notes in varied combinations rather than walking through them in source order.
+2. You can use the primary note's explanation to identify the main words, expressions, grammar points, or nuances being practised.
+3. Create new wording and situations. Use the primary point naturally. There is no need to preserve the old example's content exactly.
+4. Material from 0-{MAX_SUPPORTING_NOTES_PER_UNIT} other notes may be used when it fits naturally. Never force unrelated points together; using no supporting notes is fine.
+5. supporting_source_note_numbers must list only other notes genuinely used. Never repeat the primary note there.
 
 LANGUAGE:
-1. Write brief, clear, natural modern Japanese suitable for repeated listening.
-2. Vary ordinary casual/plain and ordinary polite です/ます Japanese. Avoid stiff or highly formal language.
-3. The English must be faithful and close to the Japanese structure: preserve clause order, contrasts, conditions, and information flow as far as still comprehensible in English, even if somewhat awkward.
-4. The Anki explanation is private reference context only. Do not use it for quotes or explanations.
-5. Wit and humor is welcome, but the Japanese phrasing should remain natural.
+1. Write natural modern Japanese that a native speaker might realistically say. Avoid contrived or overloaded phrasing.
+2. Keep each example short: ideally no more than roughly 6-8 words or brief phrase units, unless the grammar point requires more.
+3. Prefer one sentence. Two brief sentences are acceptable when they form a natural pair, such as a question and answer.
+4. When it fits naturally, use wit, humor, gallows humor, irony, or sarcasm. However, natural flow is always more important than the joke.
+5. Vary ordinary casual/plain and ordinary polite です/ます Japanese. Avoid stiff or highly formal language.
+6. The English must faithfully translate the new Japanese and remain very close to its structure, contrasts, conditions, tone, and information flow. It should closely follow the structure of the Japanese version even if somewhat unnatural in English. Nonetheless, the English should be clear and understandable.
+7. The Anki explanation is private reference context only. Do not quote it or include explanations in the output.
 
 OUTPUT FORMAT:
 Return exactly one JSON object:
@@ -418,7 +423,7 @@ Return exactly one JSON object:
   "units": [
     {{
       "primary_source_note_number": 1,
-      "supporting_source_note_numbers": [2, 5],
+      "supporting_source_note_numbers": [],
       "japanese": "One new natural Japanese sentence.",
       "english": "A faithful English translation close to the Japanese structure."
     }}
@@ -427,7 +432,7 @@ Return exactly one JSON object:
 
 All four fields are required in every unit. supporting_source_note_numbers may be an empty array. The only allowed source-note numbers are: {note_numbers}.
 
-Before returning JSON, silently verify the exact total, exactly {UNITS_PER_PRIMARY_NOTE} primary uses per note, fresh scenarios, no copied examples, natural Japanese, and close-structure English."""
+Before returning JSON, silently verify the exact total, exactly {UNITS_PER_PRIMARY_NOTE} primary uses per note, fresh scenarios, no copied examples, concise native-like Japanese, and faithful close-structure English."""
 
     compact_notes = []
     for note in shuffled_prompt_notes(batch):
@@ -909,7 +914,7 @@ def save_final_output(
 
     output = {
         "metadata": {
-            "schema_version": 2,
+            "schema_version": 3,
             "status": status,
             "generated_at": utc_now(),
             "source_file": input_path.name,
@@ -1091,7 +1096,7 @@ def validate_configuration() -> None:
 
 def main() -> bool:
     print("=" * 64)
-    print("ANKI JAPANESE CONTENT GENERATOR V2")
+    print("ANKI JAPANESE CONTENT GENERATOR V3")
     print(f"Version: {SCRIPT_VERSION} | DeepSeek")
     print("=" * 64)
 
