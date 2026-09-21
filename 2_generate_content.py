@@ -405,17 +405,18 @@ COVERAGE AND RECOMBINATION:
 1. Every allowed source note must be the primary_source_note_number in exactly {UNITS_PER_PRIMARY_NOTE} units.
 2. You can use the primary note's explanation to identify the main words, expressions, grammar points, or nuances being practised.
 3. Create new wording and situations. Use the primary point naturally. There is no need to preserve the old example's content exactly.
-4. Material from 0-{MAX_SUPPORTING_NOTES_PER_UNIT} other notes may be used when it fits naturally. Never force unrelated points together; using no supporting notes is fine.
+4. Material (words, expressions, grammar) from 0-{MAX_SUPPORTING_NOTES_PER_UNIT} other notes may be used when it fits naturally. Never force unrelated points together; using no supporting notes is fine.
 5. supporting_source_note_numbers must list only other notes genuinely used. Never repeat the primary note there.
 
 LANGUAGE:
-1. Write natural modern Japanese that a native speaker might realistically say. Avoid contrived or overloaded phrasing.
+1. Write natural modern Japanese that a native speaker might realistically say, especially in everyday situations, using common words and expressions. Avoid contrived or overloaded phrasing.
 2. Keep each example short: ideally no more than roughly 6-8 words or brief phrase units, unless the grammar point requires more.
 3. Prefer one sentence. Two brief sentences are acceptable when they form a natural pair, such as a question and answer.
 4. When it fits naturally, use wit, humor, gallows humor, irony, or sarcasm. However, natural flow is always more important than the joke.
-5. Vary ordinary casual/plain and ordinary polite です/ます Japanese. Avoid stiff or highly formal language.
-6. The English must faithfully translate the new Japanese and remain very close to its structure, contrasts, conditions, tone, and information flow. It should closely follow the structure of the Japanese version even if somewhat unnatural in English. Nonetheless, the English should be clear and understandable.
-7. The Anki explanation is private reference context only. Do not quote it or include explanations in the output.
+5. Vary ordinary casual/plain and ordinary polite です/ます Japanese. Avoid stiff or highly formal language. Vary also wording and vocabulary, do not recycle previous sentences.
+6. This will be read by TTS software, so prefer hiragana or katakana where the reading is ambiguous.
+7. The English must faithfully translate the new Japanese and remain very close to its structure, contrasts, conditions, tone, and information flow. It should closely follow the structure of the Japanese version even if somewhat unnatural in English. Nonetheless, the English should be clear and understandable.
+8. The Anki explanation is private reference context only. Do not quote it or include explanations in the output.
 
 OUTPUT FORMAT:
 Return exactly one JSON object:
@@ -432,7 +433,7 @@ Return exactly one JSON object:
 
 All four fields are required in every unit. supporting_source_note_numbers may be an empty array. The only allowed source-note numbers are: {note_numbers}.
 
-Before returning JSON, silently verify the exact total, exactly {UNITS_PER_PRIMARY_NOTE} primary uses per note, fresh scenarios, no copied examples, concise native-like Japanese, and faithful close-structure English."""
+Before returning JSON, silently verify the exact total, exactly {UNITS_PER_PRIMARY_NOTE} primary uses per note, fresh scenarios, no copied examples, concise native-like natural Japanese with sensible meaning, and faithful close-structure English."""
 
     compact_notes = []
     for note in shuffled_prompt_notes(batch):

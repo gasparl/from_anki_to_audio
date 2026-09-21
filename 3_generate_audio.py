@@ -88,7 +88,7 @@ JAPANESE_VOICES = (
 
 # Changing this creates a different deterministic playback order. It does not
 # invalidate generated unit body audio; it only rebuilds audiobook layout.
-SHUFFLE_SEED = 20260731
+SHUFFLE_SEED = 20260920
 
 # ===================== FIXED INTERNAL SETTINGS =====================
 
