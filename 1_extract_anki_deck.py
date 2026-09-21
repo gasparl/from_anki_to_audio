@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-ANKI CONTENT EXTRACTOR V3 - FULL OR DIFFICULT-CARD MODE
+ANKI CONTENT EXTRACTOR V3 - FULL OR DIFFICULT-NOTE MODE
 
 Reads an Anki .apkg deck and creates one compact JSON file containing only
 the material needed for the later AI sentence-generation step.
 
 Set ``SELECTION`` in the user settings below:
 
-* False preserves the original workflow and extracts every Anki note once.
-* True ranks individual cards/directions from their review histories, selects
-  the hardest subset, and repeats the hardest cards at the end of the output.
+* False extracts every Anki note once. Active notes keep the original two
+  generated units; fully suspended notes request only one.
+* True scores each card direction from its own review history, combines sibling
+  directions into one weighted score per note, selects the hardest notes, and
+  repeats the hardest notes at the end of the output.
 
 Output fields per note:
   id                  = simple sequential number
@@ -24,9 +26,10 @@ The explanation is retained because it often identifies the exact grammar or
 nuance the learner intended to study. It is passed to the AI as reference
 context only and is never spoken in the audiobook.
 
-In full mode, the script extracts Anki NOTES rather than generated CARDS. In
-selected mode, JP-to-EN and EN-to-JP cards are ranked independently. Their
-source-note content is still written in the same downstream-compatible shape.
+In full mode, the script extracts every Anki note once. In selected mode,
+JP-to-EN and EN-to-JP cards are scored independently, then combined 40:60 into
+one note score. Selection therefore never duplicates a note merely because
+both sibling directions were difficult.
 
 For modern Anki packages, install the only non-standard dependency with:
     pip install zstandard
@@ -49,29 +52,40 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 
-SCRIPT_VERSION = "3.1-FULL-OR-SELECTED"
+SCRIPT_VERSION = "3.4-ADAPTIVE-UNITS"
 
 
 # ===================== SIMPLE USER SETTINGS =====================
 
-# False = original full-note extraction.
-# True  = select difficult individual cards/directions from review history.
-SELECTION = True
+# False = full-note extraction, with fewer units for fully suspended notes.
+# True  = select difficult notes using combined card-direction histories.
+SELECTION = False
 
 # Put the APKG in the same folder as this script, or enter an absolute path.
 INPUT_FILE = "Base.apkg"
 OUTPUT_ROOT_DIR_NAME = "anki_audio_output_v3"
 OUTPUT_FILE = "anki_content_v3.json"
 
+# Full mode still outputs every note. These settings only vary how many units
+# Stage 2 generates: a note is "fully suspended" only when all its cards are
+# suspended, so one active direction is enough to retain the normal target.
+FULL_MODE_UNITS_PER_NOTE = 2
+FULL_MODE_UNITS_IF_FULLY_SUSPENDED = 1
+
 # ---------------- Settings used only when SELECTION = True ----------------
 
 # Total rows written, INCLUDING repeat copies.
 OUTPUT_COUNT = 300
 
-# The hardest N individual cards are included twice. With the defaults, the
+# The hardest N notes are included twice. With the defaults, the
 # first 60 rows are their first instances and the last 60 rows are copies;
-# between them are ranks 61-240. Total: 240 unique cards + 60 copies = 300.
-REPEAT_TOP_CARDS = 60
+# between them are ranks 61-240. Total: 240 unique notes + 60 copies = 300.
+REPEAT_TOP_NOTES = 60
+
+# Stage 2 generates this many learning units for each selected output row.
+# At 1, ranks 1-60 get two units in total because those rows are repeated,
+# while ranks 61-240 get one.
+UNITS_PER_SELECTED_ROW = 1
 
 # Reviews lose half their recency weight after this many days. A smaller value
 # focuses more sharply on recent study; a larger value remembers longer.
@@ -97,9 +111,19 @@ WEIGHT_LIFETIME_AGAIN_RATE = 0.25
 WEIGHT_MATURE_LAPSES = 0.15
 WEIGHT_HARD_PRESSES = 0.10
 
-# Include suspended cards. True can recover difficult leeches; use False if
-# suspended cards were intentionally removed from study.
-INCLUDE_SUSPENDED_CARDS = True
+# Each direction first receives its own complete review-history score. The two
+# sibling scores are then averaged into one NOTE score using these weights.
+# They need not add to 1. A missing, unreviewed, or excluded direction
+# contributes zero instead of letting the other direction inherit its weight.
+# EN -> JP receives slightly more weight because it measures Japanese recall;
+# JP -> EN remains substantial because it also reflects comprehension.
+NOTE_WEIGHT_EN_TO_JP = 0.60
+NOTE_WEIGHT_JP_TO_EN = 0.40
+
+# Include suspended cards in selected-mode scoring. False is the sensible
+# default when suspension means "I know this already": a suspended direction
+# is ignored, and a note with no remaining eligible direction is not selected.
+INCLUDE_SUSPENDED_CARDS = False
 
 # True: resolve relative paths beside this script.
 # False: resolve relative paths from Spyder's current working directory.
@@ -132,7 +156,7 @@ RECENT_AGAIN_SATURATION = 2.0
 MATURE_LAPSE_SATURATION = 2.0
 
 # Selected-mode console preview.
-PREVIEW_SELECTED_CARDS = 8
+PREVIEW_SELECTED_NOTES = 8
 
 # =============================================================
 
@@ -557,6 +581,11 @@ def extract_notes(
     """Create the minimal content records used by the future AI script."""
     rows = get_note_rows(connection)
     note_type_counts = Counter(int(row["mid"]) for row in rows)
+    card_queues_by_note: Dict[int, List[int]] = defaultdict(list)
+    for card_row in connection.execute("SELECT nid, queue FROM cards"):
+        card_queues_by_note[int(card_row["nid"])].append(
+            int(card_row["queue"])
+        )
 
     show_note_type_info(
         note_type_names,
@@ -576,11 +605,22 @@ def extract_notes(
 
     for index, row in enumerate(rows, 1):
         note_id = int(row["id"])
+        card_queues = card_queues_by_note.get(note_id, [])
+        all_cards_suspended = bool(card_queues) and all(
+            queue == SUSPENDED_QUEUE for queue in card_queues
+        )
+        generation_units = (
+            FULL_MODE_UNITS_IF_FULLY_SUSPENDED
+            if all_cards_suspended
+            else FULL_MODE_UNITS_PER_NOTE
+        )
         extracted.append(
             {
                 "id": index,
                 "source_note_id": note_id,
                 **extract_note_content(row, fields_by_note_type),
+                "generation_units": generation_units,
+                "all_cards_suspended": all_cards_suspended,
             }
         )
 
@@ -683,14 +723,14 @@ def score_cards(
     for row in connection.execute(query):
         card_id = int(row["card_id"])
         reviews = histories.get(card_id, [])
-        if len(reviews) < MIN_REVIEWS_PER_CARD:
-            excluded["too_few_reviews"] += 1
-            continue
         if (
             not INCLUDE_SUSPENDED_CARDS
             and int(row["card_queue"]) == SUSPENDED_QUEUE
         ):
             excluded["suspended"] += 1
+            continue
+        if len(reviews) < MIN_REVIEWS_PER_CARD:
+            excluded["too_few_reviews"] += 1
             continue
 
         content = extract_note_content(row, fields_by_note_type)
@@ -750,7 +790,7 @@ def score_cards(
                 global_hard_rate,
             ),
         }
-        difficulty_score = sum(
+        card_difficulty_score = sum(
             normalized_weights[name] * components[name]
             for name in normalized_weights
         )
@@ -767,7 +807,7 @@ def score_cards(
                 "source_note_id": int(row["note_id"]),
                 "card_ordinal": card_ordinal,
                 "card_template": template_name,
-                "difficulty_score": difficulty_score,
+                "card_difficulty_score": card_difficulty_score,
                 "components": components,
                 "review_count": len(reviews),
                 "again_count": again_count,
@@ -779,7 +819,7 @@ def score_cards(
 
     scored.sort(
         key=lambda item: (
-            -float(item["difficulty_score"]),
+            -float(item["card_difficulty_score"]),
             -float(item["components"]["recent_again"]),
             -float(item["components"]["lifetime_again_rate"]),
             -float(item["components"]["mature_lapses"]),
@@ -788,7 +828,7 @@ def score_cards(
         )
     )
     for rank, card in enumerate(scored, 1):
-        card["difficulty_rank"] = rank
+        card["card_difficulty_rank"] = rank
 
     diagnostics = {
         "review_rows_used": total_reviews,
@@ -805,54 +845,231 @@ def score_cards(
     return scored, diagnostics
 
 
-def select_output_cards(
-    ranked_cards: Sequence[Dict[str, object]],
-) -> Tuple[List[Tuple[Dict[str, object], int]], int]:
-    """Put first copies first and second copies of the hardest cards last."""
-    unique_target = OUTPUT_COUNT - REPEAT_TOP_CARDS
-    selected_unique = list(ranked_cards[:unique_target])
-    repeated_count = min(REPEAT_TOP_CARDS, len(selected_unique))
+def average_card_value(
+    cards: Sequence[Dict[str, object]],
+    field_name: str,
+) -> float:
+    """Return the arithmetic mean of one numeric card field."""
+    return sum(float(card[field_name]) for card in cards) / len(cards)
 
-    # This ordering intentionally places ranks 1..REPEAT_TOP_CARDS at the
-    # beginning, and their second instances at the very end.
-    selections = [(card, 1) for card in selected_unique]
-    selections.extend((card, 2) for card in selected_unique[:repeated_count])
+
+def average_component(
+    cards: Sequence[Dict[str, object]],
+    component_name: str,
+) -> float:
+    """Return the mean value of a card difficulty component."""
+    return sum(
+        float(card["components"][component_name]) for card in cards
+    ) / len(cards)
+
+
+def aggregate_cards_into_notes(
+    scored_cards: Sequence[Dict[str, object]],
+) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+    """Combine sibling direction scores into one ranked score per note."""
+    cards_by_note: Dict[int, List[Dict[str, object]]] = defaultdict(list)
+    for card in scored_cards:
+        cards_by_note[int(card["source_note_id"])].append(card)
+
+    en_to_jp_name = safe_field_name("EN to JP")
+    jp_to_en_name = safe_field_name("JP to EN")
+    component_names = (
+        "recent_again",
+        "lifetime_again_rate",
+        "mature_lapses",
+        "hard_presses",
+    )
+    coverage = Counter()
+    ranked_notes: List[Dict[str, object]] = []
+
+    for note_id, cards in cards_by_note.items():
+        cards = sorted(
+            cards,
+            key=lambda card: (
+                int(card["card_ordinal"]),
+                int(card["source_card_id"]),
+            ),
+        )
+        en_to_jp_cards = [
+            card for card in cards
+            if safe_field_name(str(card["card_template"])) == en_to_jp_name
+        ]
+        jp_to_en_cards = [
+            card for card in cards
+            if safe_field_name(str(card["card_template"])) == jp_to_en_name
+        ]
+
+        direction_groups = []
+        direction_scores: Dict[str, float] = {}
+        if en_to_jp_cards:
+            score = average_card_value(
+                en_to_jp_cards,
+                "card_difficulty_score",
+            )
+            direction_scores["EN to JP"] = score
+            direction_groups.append(
+                ("EN to JP", en_to_jp_cards, float(NOTE_WEIGHT_EN_TO_JP))
+            )
+        if jp_to_en_cards:
+            score = average_card_value(
+                jp_to_en_cards,
+                "card_difficulty_score",
+            )
+            direction_scores["JP to EN"] = score
+            direction_groups.append(
+                ("JP to EN", jp_to_en_cards, float(NOTE_WEIGHT_JP_TO_EN))
+            )
+
+        if direction_groups:
+            configured_weight = float(
+                NOTE_WEIGHT_EN_TO_JP + NOTE_WEIGHT_JP_TO_EN
+            )
+            note_score = sum(
+                direction_scores[name] * weight
+                for name, _group_cards, weight in direction_groups
+            ) / configured_weight
+            combined_components = {
+                component_name: sum(
+                    average_component(group_cards, component_name) * weight
+                    for _name, group_cards, weight in direction_groups
+                ) / configured_weight
+                for component_name in component_names
+            }
+            if en_to_jp_cards and jp_to_en_cards:
+                coverage["both_directions"] += 1
+            elif en_to_jp_cards:
+                coverage["en_to_jp_only"] += 1
+            else:
+                coverage["jp_to_en_only"] += 1
+            aggregation_method = (
+                "fixed direction weights; unavailable directions score zero"
+            )
+        else:
+            # Generic fallback for decks whose templates have other names.
+            note_score = average_card_value(cards, "card_difficulty_score")
+            combined_components = {
+                name: average_component(cards, name)
+                for name in component_names
+            }
+            direction_scores = {
+                str(card["card_template"]): float(
+                    card["card_difficulty_score"]
+                )
+                for card in cards
+            }
+            coverage["other_templates_only"] += 1
+            aggregation_method = "equal mean of available cards"
+
+        content_source = cards[0]
+        ranked_notes.append(
+            {
+                "source_note_id": note_id,
+                "difficulty_score": note_score,
+                "combined_components": combined_components,
+                "direction_scores": direction_scores,
+                "aggregation_method": aggregation_method,
+                "source_cards": cards,
+                "japanese": content_source["japanese"],
+                "english": content_source["english"],
+                "explanation": content_source["explanation"],
+                "example_japanese": content_source["example_japanese"],
+                "example_english": content_source["example_english"],
+            }
+        )
+
+    ranked_notes.sort(
+        key=lambda note: (
+            -float(note["difficulty_score"]),
+            -float(note["direction_scores"].get("EN to JP", -1.0)),
+            -float(note["direction_scores"].get("JP to EN", -1.0)),
+            int(note["source_note_id"]),
+        )
+    )
+    for rank, note in enumerate(ranked_notes, 1):
+        note["difficulty_rank"] = rank
+
+    diagnostics = {
+        "notes_scored": len(ranked_notes),
+        "note_direction_coverage": dict(coverage),
+    }
+    return ranked_notes, diagnostics
+
+
+def select_output_notes(
+    ranked_notes: Sequence[Dict[str, object]],
+) -> Tuple[List[Tuple[Dict[str, object], int]], int]:
+    """Put unique notes first and second copies of the hardest notes last."""
+    unique_target = OUTPUT_COUNT - REPEAT_TOP_NOTES
+    selected_unique = list(ranked_notes[:unique_target])
+    repeated_count = min(REPEAT_TOP_NOTES, len(selected_unique))
+
+    # This ordering places ranks 1..REPEAT_TOP_NOTES at the beginning, and
+    # their intentional second instances at the very end.
+    selections = [(note, 1) for note in selected_unique]
+    selections.extend((note, 2) for note in selected_unique[:repeated_count])
     return selections, repeated_count
+
+
+def card_audit_record(card: Dict[str, object]) -> Dict[str, object]:
+    """Return compact, JSON-safe evidence for one contributing card."""
+    return {
+        "source_card_id": int(card["source_card_id"]),
+        "card_ordinal": int(card["card_ordinal"]),
+        "card_template": card["card_template"],
+        "card_difficulty_score": round(
+            float(card["card_difficulty_score"]), 8
+        ),
+        "review_count": int(card["review_count"]),
+        "again_count": int(card["again_count"]),
+        "hard_count": int(card["hard_count"]),
+        "mature_lapse_count": int(card["mature_lapse_count"]),
+        "difficulty_components": {
+            name: round(float(value), 8)
+            for name, value in card["components"].items()
+        },
+    }
 
 
 def make_selected_records(
     selections: Sequence[Tuple[Dict[str, object], int]],
 ) -> List[Dict[str, object]]:
-    """Create normal pipeline rows plus selection audit fields."""
+    """Create normal pipeline rows plus note-ranking audit fields."""
     records: List[Dict[str, object]] = []
-    for output_id, (card, copy_number) in enumerate(selections, 1):
+    for output_id, (note, copy_number) in enumerate(selections, 1):
+        source_cards = list(note["source_cards"])
         records.append(
             {
                 # These seven fields are the unchanged V3 contract.
                 "id": output_id,
-                "source_note_id": int(card["source_note_id"]),
-                "japanese": card["japanese"],
-                "english": card["english"],
-                "explanation": card["explanation"],
-                "example_japanese": card["example_japanese"],
-                "example_english": card["example_english"],
+                "source_note_id": int(note["source_note_id"]),
+                "japanese": note["japanese"],
+                "english": note["english"],
+                "explanation": note["explanation"],
+                "example_japanese": note["example_japanese"],
+                "example_english": note["example_english"],
                 # Stage 2 ignores these useful audit fields.
-                "source_card_id": int(card["source_card_id"]),
-                "card_ordinal": int(card["card_ordinal"]),
-                "card_template": card["card_template"],
-                "difficulty_rank": int(card["difficulty_rank"]),
+                "difficulty_rank": int(note["difficulty_rank"]),
                 "difficulty_score": round(
-                    float(card["difficulty_score"]), 8
+                    float(note["difficulty_score"]), 8
                 ),
                 "output_copy": copy_number,
-                "review_count": int(card["review_count"]),
-                "again_count": int(card["again_count"]),
-                "hard_count": int(card["hard_count"]),
-                "mature_lapse_count": int(card["mature_lapse_count"]),
-                "difficulty_components": {
+                "aggregation_method": note["aggregation_method"],
+                "direction_scores": {
                     name: round(float(value), 8)
-                    for name, value in card["components"].items()
+                    for name, value in note["direction_scores"].items()
                 },
+                "combined_difficulty_components": {
+                    name: round(float(value), 8)
+                    for name, value in note["combined_components"].items()
+                },
+                # Stage 2 honors this optional per-row generation target.
+                "generation_units": UNITS_PER_SELECTED_ROW,
+                "source_card_ids": [
+                    int(card["source_card_id"]) for card in source_cards
+                ],
+                "card_score_details": [
+                    card_audit_record(card) for card in source_cards
+                ],
             }
         )
     return records
@@ -872,6 +1089,15 @@ def save_results(
             "collection_member": collection_member,
             "total_notes": len(notes),
             "sort_order": SORT_ORDER,
+            "generation_allocation": {
+                "normal_units_per_note": FULL_MODE_UNITS_PER_NOTE,
+                "fully_suspended_units_per_note": (
+                    FULL_MODE_UNITS_IF_FULLY_SUSPENDED
+                ),
+                "fully_suspended_notes": sum(
+                    bool(note.get("all_cards_suspended")) for note in notes
+                ),
+            },
             "content_fields": [
                 "japanese",
                 "english",
@@ -898,7 +1124,11 @@ def save_selected_results(
     repeated_count: int,
 ) -> None:
     """Save selected records with transparent ranking metadata."""
-    unique_cards = {int(row["source_card_id"]) for row in records}
+    unique_cards = {
+        int(card_id)
+        for row in records
+        for card_id in row["source_card_ids"]
+    }
     unique_notes = {int(row["source_note_id"]) for row in records}
     output = {
         "metadata": {
@@ -907,25 +1137,34 @@ def save_selected_results(
             "source_file": input_path.name,
             "collection_member": collection_member,
             "total_notes": len(records),
-            "unique_cards": len(unique_cards),
+            "unique_contributing_cards": len(unique_cards),
             "unique_source_notes": len(unique_notes),
-            "repeated_cards": repeated_count,
-            "ranked_unit": "individual Anki card/direction",
+            "repeated_notes": repeated_count,
+            "ranked_unit": "Anki note with combined direction scores",
+            "ranking_formula": (
+                "weighted mean of independently scored EN-to-JP and "
+                "JP-to-EN cards; unavailable directions contribute zero"
+            ),
             "output_order": (
-                "unique cards in difficulty order, followed by second "
-                "copies of the hardest cards"
+                "unique notes in combined-score order, followed by second "
+                "copies of the hardest notes"
             ),
             "selection_settings": {
                 "selection": SELECTION,
                 "output_count_including_repeats": OUTPUT_COUNT,
-                "repeat_top_cards": REPEAT_TOP_CARDS,
+                "repeat_top_notes": REPEAT_TOP_NOTES,
+                "units_per_selected_row": UNITS_PER_SELECTED_ROW,
                 "recency_half_life_days": RECENCY_HALF_LIFE_DAYS,
                 "old_review_weight_floor": OLD_REVIEW_WEIGHT_FLOOR,
                 "smoothing_prior_reviews": SMOOTHING_PRIOR_REVIEWS,
                 "minimum_reviews_per_card": MIN_REVIEWS_PER_CARD,
                 "mature_interval_days": MATURE_INTERVAL_DAYS,
                 "include_suspended_cards": INCLUDE_SUSPENDED_CARDS,
-                "score_weights": diagnostics["normalized_weights"],
+                "card_score_weights": diagnostics["normalized_weights"],
+                "note_direction_weights": {
+                    "EN to JP": NOTE_WEIGHT_EN_TO_JP,
+                    "JP to EN": NOTE_WEIGHT_JP_TO_EN,
+                },
             },
             "selection_diagnostics": diagnostics,
             "content_fields": [
@@ -951,6 +1190,24 @@ def validate_configuration() -> None:
         raise ValueError(
             f"Unknown SORT_ORDER: {SORT_ORDER}. Use 'note_id' or 'card_due'."
         )
+    unit_settings = {
+        "FULL_MODE_UNITS_PER_NOTE": FULL_MODE_UNITS_PER_NOTE,
+        "FULL_MODE_UNITS_IF_FULLY_SUSPENDED": (
+            FULL_MODE_UNITS_IF_FULLY_SUSPENDED
+        ),
+        "UNITS_PER_SELECTED_ROW": UNITS_PER_SELECTED_ROW,
+    }
+    for setting_name, value in unit_settings.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{setting_name} must be a positive integer")
+    if (
+        FULL_MODE_UNITS_IF_FULLY_SUSPENDED
+        > FULL_MODE_UNITS_PER_NOTE
+    ):
+        raise ValueError(
+            "FULL_MODE_UNITS_IF_FULLY_SUSPENDED cannot exceed "
+            "FULL_MODE_UNITS_PER_NOTE"
+        )
     if not SELECTION:
         return
 
@@ -959,13 +1216,13 @@ def validate_configuration() -> None:
     if OUTPUT_COUNT < 1:
         raise ValueError("OUTPUT_COUNT must be at least 1")
     if (
-        isinstance(REPEAT_TOP_CARDS, bool)
-        or not isinstance(REPEAT_TOP_CARDS, int)
+        isinstance(REPEAT_TOP_NOTES, bool)
+        or not isinstance(REPEAT_TOP_NOTES, int)
     ):
-        raise ValueError("REPEAT_TOP_CARDS must be an integer")
-    if not 0 <= REPEAT_TOP_CARDS < OUTPUT_COUNT:
+        raise ValueError("REPEAT_TOP_NOTES must be an integer")
+    if not 0 <= REPEAT_TOP_NOTES < OUTPUT_COUNT:
         raise ValueError(
-            "REPEAT_TOP_CARDS must be between 0 and OUTPUT_COUNT - 1"
+            "REPEAT_TOP_NOTES must be between 0 and OUTPUT_COUNT - 1"
         )
     if RECENCY_HALF_LIFE_DAYS <= 0:
         raise ValueError("RECENCY_HALF_LIFE_DAYS must be greater than 0")
@@ -989,6 +1246,20 @@ def validate_configuration() -> None:
         raise ValueError("Difficulty weights cannot be negative")
     if sum(weights) <= 0:
         raise ValueError("At least one difficulty weight must be positive")
+    note_direction_weights = (
+        NOTE_WEIGHT_EN_TO_JP,
+        NOTE_WEIGHT_JP_TO_EN,
+    )
+    if any(
+        isinstance(weight, bool)
+        or not isinstance(weight, (int, float))
+        or not math.isfinite(float(weight))
+        or weight <= 0
+        for weight in note_direction_weights
+    ):
+        raise ValueError(
+            "Note direction weights must be finite numbers above 0"
+        )
     if not isinstance(INCLUDE_SUSPENDED_CARDS, bool):
         raise ValueError("INCLUDE_SUSPENDED_CARDS must be True or False")
 
@@ -1008,6 +1279,22 @@ def print_summary(notes: List[Dict[str, object]], output_path: Path) -> None:
     print("=" * 60)
     print(f"Notes extracted: {len(notes):,}")
     print(f"Output file:    {output_path}")
+
+    generation_counts = Counter(
+        int(note.get("generation_units", FULL_MODE_UNITS_PER_NOTE))
+        for note in notes
+    )
+    fully_suspended = sum(
+        bool(note.get("all_cards_suspended")) for note in notes
+    )
+    print(f"Fully suspended: {fully_suspended:,}")
+    print(
+        "Unit targets:    "
+        + ", ".join(
+            f"{units} unit(s): {count:,} notes"
+            for units, count in sorted(generation_counts.items())
+        )
+    )
 
     print("\nFIELD COVERAGE")
     for field_name in field_names:
@@ -1048,62 +1335,75 @@ def print_selected_summary(
     output_path: Path,
     diagnostics: Dict[str, object],
 ) -> None:
-    """Print selected-mode counts, directions, and highest-ranked cards."""
-    unique_cards = {int(row["source_card_id"]) for row in records}
-    unique_notes = {int(row["source_note_id"]) for row in records}
+    """Print selected-mode counts and highest-ranked combined notes."""
+    unique_records = [
+        row for row in records if int(row["output_copy"]) == 1
+    ]
+    unique_cards = {
+        int(card_id)
+        for row in unique_records
+        for card_id in row["source_card_ids"]
+    }
+    unique_notes = {int(row["source_note_id"]) for row in unique_records}
     second_copies = sum(int(row["output_copy"]) == 2 for row in records)
-    directions = Counter(str(row["card_template"]) for row in records)
+    coverage = Counter()
+    for row in unique_records:
+        directions = set(row["direction_scores"])
+        if {"EN to JP", "JP to EN"}.issubset(directions):
+            coverage["both directions"] += 1
+        elif "EN to JP" in directions:
+            coverage["EN to JP only"] += 1
+        elif "JP to EN" in directions:
+            coverage["JP to EN only"] += 1
+        else:
+            coverage["other templates"] += 1
 
     print("\n" + "=" * 64)
-    print("DIFFICULT-CARD EXTRACTION COMPLETE")
+    print("DIFFICULT-NOTE EXTRACTION COMPLETE")
     print("=" * 64)
     print(f"Output rows:          {len(records):,}")
-    print(f"Unique cards:        {len(unique_cards):,}")
-    print(f"Unique source notes: {len(unique_notes):,}")
-    print(f"Second copies:       {second_copies:,}")
-    print(f"Cards ranked:        {diagnostics['cards_scored']:,}")
+    print(
+        "Stage-2 units:       "
+        f"{sum(int(row['generation_units']) for row in records):,}"
+    )
+    print(f"Unique notes:        {len(unique_notes):,}")
+    print(f"Contributing cards:  {len(unique_cards):,}")
+    print(f"Repeated notes:      {second_copies:,}")
+    print(f"Notes ranked:        {diagnostics['notes_scored']:,}")
+    print(f"Cards scored first:  {diagnostics['cards_scored']:,}")
     print(f"Output file:         {output_path}")
 
-    print("\nSELECTED DIRECTIONS (including repeats)")
-    for direction, count in directions.most_common():
-        print(f"  {direction}: {count:,}")
+    print("\nDIRECTION COVERAGE (unique selected notes)")
+    for label, count in coverage.most_common():
+        print(f"  {label}: {count:,}")
 
     if len(records) < OUTPUT_COUNT:
         print(
             f"\nWARNING: Requested {OUTPUT_COUNT:,} rows, but only "
-            f"{len(records):,} could be produced from eligible cards."
+            f"{len(records):,} could be produced from eligible notes."
         )
 
-    if records and PREVIEW_SELECTED_CARDS > 0:
-        print("\nHIGHEST-RANKED UNIQUE CARDS")
+    if unique_records and PREVIEW_SELECTED_NOTES > 0:
+        print("\nHIGHEST-RANKED UNIQUE NOTES")
         print("-" * 64)
-        shown = 0
-        seen_cards = set()
-        for record in records:
-            card_id = int(record["source_card_id"])
-            if card_id in seen_cards:
-                continue
-            seen_cards.add(card_id)
-            shown += 1
+        for record in unique_records[:PREVIEW_SELECTED_NOTES]:
+            direction_text = ", ".join(
+                f"{name}={float(score):.4f}"
+                for name, score in record["direction_scores"].items()
+            )
             print(
                 f"#{record['difficulty_rank']:>3}  "
                 f"score={record['difficulty_score']:.4f}  "
-                f"{record['card_template']}  "
-                f"reviews={record['review_count']}  "
-                f"Again={record['again_count']}  "
-                f"Hard={record['hard_count']}  "
-                f"mature lapses={record['mature_lapse_count']}"
+                f"[{direction_text}]"
             )
             print(f"     {record['japanese']} / {record['english']}")
-            if shown >= PREVIEW_SELECTED_CARDS:
-                break
 
     print("\nORDER CHECK")
     print(
-        f"  First {second_copies:,} rows: first instances of the hardest cards"
+        f"  First {second_copies:,} rows: first instances of the hardest notes"
     )
     print(
-        f"  Last {second_copies:,} rows: second instances of those same cards"
+        f"  Last {second_copies:,} rows: second instances of those same notes"
     )
     print("\nThe JSON is ready for the V3 AI-generation script.")
     print("=" * 64)
@@ -1121,17 +1421,28 @@ def main() -> bool:
 
     print(
         "Mode:           "
-        + ("SELECTED DIFFICULT CARDS" if SELECTION else "FULL DECK")
+        + ("SELECTED DIFFICULT NOTES" if SELECTION else "FULL DECK")
     )
     print(f"Input:          {input_path}")
     print(f"Output folder:  {get_output_root()}")
     print(f"Output:         {output_path}")
     if SELECTION:
         print(f"Output rows:    {OUTPUT_COUNT} (including repeats)")
-        print(f"Repeat top:     {REPEAT_TOP_CARDS}")
+        print(f"Repeat top:     {REPEAT_TOP_NOTES} notes")
+        print(f"Units per row:  {UNITS_PER_SELECTED_ROW}")
         print(f"Recency:        {RECENCY_HALF_LIFE_DAYS:g}-day half-life")
+        print(
+            "Note combine:   "
+            f"EN->JP {NOTE_WEIGHT_EN_TO_JP:g}, "
+            f"JP->EN {NOTE_WEIGHT_JP_TO_EN:g}"
+        )
     else:
         print(f"Sort order:     {SORT_ORDER}")
+        print(
+            "Units per note: "
+            f"{FULL_MODE_UNITS_PER_NOTE} active / "
+            f"{FULL_MODE_UNITS_IF_FULLY_SUSPENDED} fully suspended"
+        )
     print(f"Remove furigana: {REMOVE_FURIGANA}")
     print("=" * 60)
 
@@ -1197,13 +1508,19 @@ def main() -> bool:
                     print("\nSCORING INDIVIDUAL CARDS")
                     print("-" * 60)
                     template_names = load_template_names(connection)
-                    ranked_cards, diagnostics = score_cards(
+                    scored_cards, diagnostics = score_cards(
                         connection,
                         fields_by_note_type,
                         template_names,
                     )
-                    selections, repeated_count = select_output_cards(
-                        ranked_cards
+                    print("\nCOMBINING CARD SCORES INTO NOTE SCORES")
+                    print("-" * 60)
+                    ranked_notes, note_diagnostics = (
+                        aggregate_cards_into_notes(scored_cards)
+                    )
+                    diagnostics.update(note_diagnostics)
+                    selections, repeated_count = select_output_notes(
+                        ranked_notes
                     )
                     notes = make_selected_records(selections)
                 else:
@@ -1217,7 +1534,7 @@ def main() -> bool:
 
         if not notes:
             if SELECTION:
-                print("\nERROR: No eligible reviewed cards were found.")
+                print("\nERROR: No eligible reviewed notes were found.")
             else:
                 print("\nERROR: No notes were found in the deck.")
             return False
