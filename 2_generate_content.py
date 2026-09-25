@@ -11,8 +11,9 @@ selected-mode defaults, each unique note requests two units and the hardest
 notes request three distinct units without duplicate input rows. Before writing
 the sentences, the model must plan a different learning focus, scenario, and
 sentence design for every variant. The Anki explanation identifies the intended
-grammar or nuance. Existing card examples are context only: generated sentences
-must use new wording and situations.
+grammar or nuance. Existing card examples are context only. A useful change of
+noun, object, setting, detail, or framing is enough to make another variant;
+only exact copies are rejected by the validator.
 
 The output intentionally contains no explanations, breakdowns, or separate
 literal translations. Each unit contains only:
@@ -45,7 +46,6 @@ import re
 import time
 import unicodedata
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -55,7 +55,7 @@ except ImportError:
     requests = None
 
 
-SCRIPT_VERSION = "3.3-PLAN-FIRST-DIVERSITY"
+SCRIPT_VERSION = "3.4-SIMPLE-ROBUST-DIVERSITY"
 
 
 # ===================== ONLY USER SETTING =====================
@@ -100,14 +100,9 @@ RETRY_JITTER_SECONDS = 0.5
 BATCH_DELAY_SECONDS = 1.0
 STOP_AFTER_CONSECUTIVE_FAILURES = 3
 
-# Reject generated sentences that are effectively copies of old examples.
-NEAR_COPY_SIMILARITY = 0.93
-MIN_NEAR_COPY_LENGTH = 10
-
-# Diversity checks back up the plan-first generation contract. They are not
-# the primary source of diversity; they trigger a complete batch retry only
-# when the generated realization contradicts its own plans.
-SIBLING_SIMILARITY = 0.90
+# Diversity comes from the prompt and the model's plan. Validation deliberately
+# stays objective: malformed output and exact normalized copies are rejected,
+# while reasonable changes of wording, framing, or one content word are valid.
 
 # Console output.
 PREVIEW_UNITS = 4
@@ -361,10 +356,29 @@ def progress_settings() -> Dict:
         "context_shuffle_seed": CONTEXT_SHUFFLE_SEED,
         "temperature": TEMPERATURE,
         "maximum_output_tokens": MAX_OUTPUT_TOKENS,
-        "near_copy_similarity": NEAR_COPY_SIMILARITY,
-        "sibling_similarity": SIBLING_SIMILARITY,
+        "validation_policy": "structure, mapping, and exact copies only",
         "generation_method": "plan all variants before realization",
     }
+
+
+def progress_settings_are_resume_compatible(saved: Dict) -> bool:
+    """Allow validation-only upgrades without discarding completed batches."""
+    if not isinstance(saved, dict):
+        return False
+
+    current = progress_settings()
+    generation_keys = (
+        "model",
+        "thinking_enabled",
+        "notes_per_batch",
+        "units_per_primary_note",
+        "maximum_supporting_notes_per_unit",
+        "context_shuffle_seed",
+        "temperature",
+        "maximum_output_tokens",
+        "generation_method",
+    )
+    return all(saved.get(key) == current.get(key) for key in generation_keys)
 
 
 def new_progress(input_hash: str, total_batches: int) -> Dict:
@@ -397,10 +411,18 @@ def load_or_create_progress(
             f"Delete or rename {path.name} to start a new run."
         )
 
-    if progress.get("settings") != progress_settings():
+    saved_settings = progress.get("settings")
+    current_settings = progress_settings()
+    if not progress_settings_are_resume_compatible(saved_settings):
         raise ValueError(
             "V3 generation settings changed since progress was created. "
             f"Delete or rename {path.name} to start a new run."
+        )
+    if saved_settings != current_settings:
+        progress["settings"] = current_settings
+        print(
+            "Updating compatible validation settings; completed batches "
+            "will be kept."
         )
 
     if int(progress.get("total_batches", 0)) != total_batches:
@@ -444,11 +466,11 @@ PLAN FIRST, THEN WRITE:
 1. Complete the entire plans array before writing any unit. Make one plan group for every allowed source note and exactly the requested number of numbered variants. Required primary counts (note: units): {target_text}.
 2. Each variant plan needs a specific learning_focus, a concrete scenario, and a sentence_design such as a question, request, consequence, contrast, correction, condition, or observation.
 3. Use the explanation to identify the actual words, senses, grammar points, and nuances being practised. When several genuine points are available, distribute them across variants before repeating one. A learning point counts only when it is central to the Japanese sentence and used correctly.
-4. When there is only one genuine point, keep that point but change both the situation and what the speaker is doing with the sentence. A different subject, time word, politeness level, particle ending, or tense alone does not create a distinct variant.
-5. If japanese_point is already a complete sentence, extract and reuse its learning point rather than copying its whole proposition. Do not reproduce it, minimally extend it, or make a near-paraphrase. Apply the same rule to the old example.
+4. When there is only one genuine point, keep that point but change both the situation and what the speaker is doing with the sentence. A different politeness level, particle ending, or tense alone does not create a distinct variant.
+5. If japanese_point is already a complete sentence, reuse its learning point and structure but do not return the exact sentence unchanged. Changing a meaningful noun, subject, object, detail, setting, or framing is enough. Apply the same rule to the old example.
 6. After all plans are complete, write exactly one unit for every planned (primary_source_note_number, variant_number) pair. The sentence must realize its own plan, and sibling units for one primary note must be meaningfully different when heard without the plans.
 
-For example, if the source is 上司から講演会に誘われる, 上司から講演会に誘われた and 上司から講演会に誘われました are not distinct variants. Plan different concrete propositions that practise the intended word or pattern in different situations.
+For example, if the source is 上司から講演会に誘われる, changing only tense or politeness is not enough, but changing 上司 or 講演会, or adding useful framing, can make a valid new example.
 
 SUPPORTING MATERIAL:
 1. Material from 0-{MAX_SUPPORTING_NOTES_PER_UNIT} other notes may be used when it fits naturally. Never force unrelated points together; using no supporting notes is fine.
@@ -458,9 +480,9 @@ LANGUAGE:
 1. Write natural modern Japanese that a native speaker might realistically say, especially in everyday situations, using common words and expressions. Avoid contrived or overloaded phrasing.
 2. Keep each example short: ideally no more than roughly 6-8 words or brief phrase units, unless the grammar point requires more.
 3. Prefer one sentence. Two brief sentences are occasionally acceptable when they form a natural pair, such as a question and answer.
-4. Light humor or playfulness is welcome only when it arises naturally from the planned situation.
+4. When it arises naturally from the planned situation, you are welcome to be playful and amusing, using wit, humor, irony, sarcasm.
 5. Across the batch, use an appropriate mix of ordinary casual/plain and ordinary polite です/ます Japanese. Politeness changes do not count as the diversity between siblings.
-6. This will be read by TTS software, so prefer hiragana or katakana over ambiguous kanji when the surrounding context still makes the intended word boundaries and prosody clear.
+6. This will be read by TTS software, so always prefer hiragana or katakana over kanji when the surrounding context still makes the intended word boundaries and prosody clear, and especially when the kanji reading is ambiguous.
 7. The English must faithfully translate the new Japanese and stay close to its structure, contrasts, conditions, tone, and information flow while remaining understandable.
 8. The Anki explanation and all plan fields are private working context. Do not put explanations into the Japanese or English.
 
@@ -493,7 +515,7 @@ Return exactly one JSON object with fields in this order:
 
 Every plan and unit field shown above is required. supporting_source_note_numbers may be an empty array. The only allowed source-note numbers are: {note_numbers}.
 
-Before returning JSON, compare sibling plans and sentences side by side. Rewrite any pair whose distinction is merely a name, subject, time word, minor modifier, tense, or politeness change. Verify the exact counts, unique (primary, variant) pairs, fresh propositions, correct central use of each learning focus, natural Japanese, and faithful English."""
+Before returning JSON, compare sibling plans and sentences side by side. Rewrite exact duplicates and pairs that differ only in punctuation, particle ending, tense, or politeness. A changed noun, subject, object, time, setting, detail, or useful framing can be enough. Verify the exact counts, unique (primary, variant) pairs, correct central use of each learning focus, natural Japanese, and faithful English."""
 
     compact_notes = []
     for note in shuffled_prompt_notes(batch):
@@ -516,8 +538,8 @@ Before returning JSON, compare sibling plans and sentences side by side. Rewrite
         "units. Use each Anki explanation to pinpoint and distribute the "
         "intended primary words, grammar points, senses, or nuances. The "
         "explanations are private context and should not appear in the output. "
-        "The Japanese point and old examples show what to practise; complete "
-        "sentences among them must not be reused as sentence templates.\n\n"
+        "The Japanese point and old examples show what to practise. Their "
+        "structure may be reused, but do not copy a complete sentence exactly.\n\n"
         "SOURCE NOTES:\n"
         + json.dumps(compact_notes, ensure_ascii=False, indent=2)
     )
@@ -570,6 +592,17 @@ def parse_json_object(response_text: str) -> Optional[Dict]:
     if not response_text:
         return None
 
+    def accept_object(value) -> Optional[Dict]:
+        if isinstance(value, dict):
+            return value
+        if (
+            isinstance(value, list)
+            and len(value) == 1
+            and isinstance(value[0], dict)
+        ):
+            return value[0]
+        return None
+
     text = response_text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
@@ -577,7 +610,7 @@ def parse_json_object(response_text: str) -> Optional[Dict]:
 
     try:
         data = json.loads(text)
-        return data if isinstance(data, dict) else None
+        return accept_object(data)
     except json.JSONDecodeError:
         pass
 
@@ -586,7 +619,7 @@ def parse_json_object(response_text: str) -> Optional[Dict]:
     if start >= 0 and end > start:
         try:
             data = json.loads(text[start:end + 1])
-            return data if isinstance(data, dict) else None
+            return accept_object(data)
         except json.JSONDecodeError:
             return None
 
@@ -608,7 +641,8 @@ def coerce_note_numbers(value) -> Optional[List[int]]:
     return numbers
 
 
-def compact_japanese_for_similarity(value: str) -> str:
+def compact_japanese_for_comparison(value: str) -> str:
+    """Normalize harmless typography differences for exact-copy checks."""
     text = unicodedata.normalize("NFKC", value or "")
     text = re.sub(r"\s+", "", text)
     text = re.sub(r"[、。！？!?.,・…\-—―「」『』（）()\[\]]", "", text)
@@ -625,49 +659,19 @@ def clean_private_plan_text(value) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def compact_plan_text(value: str) -> str:
-    text = unicodedata.normalize("NFKC", value or "").casefold()
-    return re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
-
-
-def compact_english_for_similarity(value: str) -> str:
-    text = unicodedata.normalize("NFKC", value or "").casefold()
-    return re.sub(r"[^a-z0-9]+", "", text)
-
-
-def similarity_is_too_high(
-    first: str,
-    second: str,
-    threshold: float,
-) -> bool:
-    if not first or not second:
-        return False
-    if first == second:
-        return True
-    if min(len(first), len(second)) < MIN_NEAR_COPY_LENGTH:
-        return False
-    return SequenceMatcher(None, first, second).ratio() >= threshold
-
-
-def find_near_copy(japanese: str, notes: Sequence[Dict]) -> Optional[int]:
-    generated = compact_japanese_for_similarity(japanese)
+def find_exact_old_example_copy(
+    japanese: str,
+    notes: Sequence[Dict],
+) -> Optional[int]:
+    generated = compact_japanese_for_comparison(japanese)
     if not generated:
         return None
 
     for note in notes:
-        old_example = compact_japanese_for_similarity(
+        old_example = compact_japanese_for_comparison(
             str(note.get("example_japanese", ""))
         )
-        if not old_example:
-            continue
-        if generated == old_example:
-            return int(note["id"])
-        if (
-            len(generated) >= MIN_NEAR_COPY_LENGTH
-            and len(old_example) >= MIN_NEAR_COPY_LENGTH
-            and SequenceMatcher(None, generated, old_example).ratio()
-            >= NEAR_COPY_SIMILARITY
-        ):
+        if old_example and generated == old_example:
             return int(note["id"])
 
     return None
@@ -744,8 +748,6 @@ def validate_and_clean_response(
                 f"received {len(raw_variants)}"
             )
 
-        scenarios = set()
-        designs = set()
         seen_variant_numbers = set()
         for variant_position, raw_variant in enumerate(raw_variants, 1):
             label = f"Plan {primary}.{variant_position}"
@@ -781,21 +783,6 @@ def validate_and_clean_response(
             if not design:
                 errors.append(f"{label} has no sentence_design")
 
-            compact_scenario = compact_plan_text(scenario)
-            compact_design = compact_plan_text(design)
-            if compact_scenario:
-                if compact_scenario in scenarios:
-                    errors.append(
-                        f"Primary note {primary} repeats a planned scenario"
-                    )
-                scenarios.add(compact_scenario)
-            if compact_design:
-                if compact_design in designs:
-                    errors.append(
-                        f"Primary note {primary} repeats a sentence design"
-                    )
-                designs.add(compact_design)
-
             if key in expected_variant_keys and key not in plans_by_key:
                 plans_by_key[key] = {
                     "learning_focus": focus,
@@ -824,9 +811,6 @@ def validate_and_clean_response(
     primary_counts = {number: 0 for number in allowed_numbers}
     seen_japanese = set()
     seen_unit_keys = set()
-    units_by_primary: Dict[int, List[Tuple[str, str, str]]] = {
-        number: [] for number in allowed_numbers
-    }
     cleaned_units: List[Dict] = []
 
     for position, raw in enumerate(raw_units, 1):
@@ -908,39 +892,27 @@ def validate_and_clean_response(
         if JAPANESE_RE.search(english_raw):
             errors.append(f"{label} contains Japanese inside English")
 
-        if japanese in seen_japanese:
+        generated_compact = compact_japanese_for_comparison(japanese)
+        if generated_compact and generated_compact in seen_japanese:
             errors.append(f"{label} duplicates another Japanese sentence")
-        seen_japanese.add(japanese)
+        if generated_compact:
+            seen_japanese.add(generated_compact)
 
-        copied_from = find_near_copy(japanese, batch["notes"])
+        copied_from = find_exact_old_example_copy(japanese, batch["notes"])
         if copied_from is not None:
             errors.append(
-                f"{label} is too similar to the old example for note "
+                f"{label} exactly copies the old example for note "
                 f"{copied_from}"
             )
 
         if primary in notes_by_number:
-            generated_compact = compact_japanese_for_similarity(japanese)
-            source_compact = compact_japanese_for_similarity(
+            source_compact = compact_japanese_for_comparison(
                 str(notes_by_number[primary].get("japanese", ""))
             )
-            if similarity_is_too_high(
-                generated_compact,
-                source_compact,
-                NEAR_COPY_SIMILARITY,
-            ):
+            if generated_compact and generated_compact == source_compact:
                 errors.append(
-                    f"{label} copies or minimally rewrites primary source "
-                    f"note {primary}"
+                    f"{label} exactly copies primary source note {primary}"
                 )
-
-            units_by_primary[primary].append(
-                (
-                    label,
-                    generated_compact,
-                    compact_english_for_similarity(english),
-                )
-            )
 
         source_numbers = []
         if primary in allowed_numbers:
@@ -980,29 +952,6 @@ def validate_and_clean_response(
     missing_unit_keys = sorted(expected_variant_keys - seen_unit_keys)
     if missing_unit_keys:
         errors.append(f"Missing realized variants: {missing_unit_keys}")
-
-    for primary in sorted(units_by_primary):
-        sibling_units = units_by_primary[primary]
-        for index, (first_label, first_japanese, first_english) in enumerate(
-            sibling_units
-        ):
-            for second_label, second_japanese, second_english in (
-                sibling_units[index + 1:]
-            ):
-                if similarity_is_too_high(
-                    first_japanese,
-                    second_japanese,
-                    SIBLING_SIMILARITY,
-                ):
-                    errors.append(
-                        f"{first_label} and {second_label} are too similar "
-                        f"for primary note {primary}"
-                    )
-                if first_english and first_english == second_english:
-                    errors.append(
-                        f"{first_label} and {second_label} have duplicate "
-                        f"English for primary note {primary}"
-                    )
 
     if errors:
         return None, errors
@@ -1403,10 +1352,6 @@ def validate_configuration() -> None:
         raise ValueError("MAX_SUPPORTING_NOTES_PER_UNIT cannot be negative")
     if MAX_CONTENT_RETRIES < 1 or MAX_NETWORK_RETRIES < 1:
         raise ValueError("Retry counts must be at least 1")
-    if not 0 < NEAR_COPY_SIMILARITY <= 1:
-        raise ValueError("NEAR_COPY_SIMILARITY must be between 0 and 1")
-    if not 0 < SIBLING_SIMILARITY <= 1:
-        raise ValueError("SIBLING_SIMILARITY must be between 0 and 1")
 
 
 def main() -> bool:
