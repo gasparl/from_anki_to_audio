@@ -53,42 +53,54 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 
-SCRIPT_VERSION = "3.6-SELECTION-TWO-PLUS-ONE"
+SCRIPT_VERSION = "3.7-CLEAR-SETTINGS"
 
 
-# ===================== SIMPLE USER SETTINGS =====================
+# ==================== QUICK SETTINGS ====================
+# Normally, these are the only values you need to change.
 
-# False = full-note extraction, with fewer units for fully suspended notes.
-# True  = select difficult notes using combined card-direction histories.
+# True  = output only the most difficult notes, ranked from review history.
+# False = output the whole deck (with fewer examples for suspended notes).
 SELECTION = True
 
 # Put the APKG in the same folder as this script, or enter an absolute path.
 INPUT_FILE = "Base.apkg"
+
+# Used only when SELECTION = True:
+
+# Total number of UNIQUE notes to put in the output JSON.
+NUMBER_OF_NOTES_TO_SELECT = 240
+
+# Out of the notes above, how many of the hardest should receive extra
+# attention. With 60, ranks 1-60 are the extra-difficult group.
+NUMBER_OF_EXTRA_DIFFICULT_NOTES = 60
+
+# How many DIFFERENT examples Stage 2 should create for each selected note.
+# These are requests to the AI, not duplicate rows in this extraction.
+EXAMPLES_PER_NORMAL_SELECTED_NOTE = 2
+EXAMPLES_PER_EXTRA_DIFFICULT_NOTE = 3
+
+# How strongly ranking should favor recent problems, expressed in months.
+# At 3 months, a review from 3 months ago has about half the recency weight of
+# a review today; at 6 months it has about one quarter. Smaller numbers focus
+# more sharply on recent study; larger numbers remember more history.
+# This is a smooth fade, not a hard cutoff, so older evidence is not discarded.
+RECENCY_FOCUS_MONTHS = 3.0
+
+# Example with the defaults above:
+#   240 output notes = 60 extra-difficult x 3 examples
+#                    + 180 normal          x 2 examples
+#   Stage 2 will therefore request 540 examples in total.
+
+# ================== LESS-COMMON SETTINGS ==================
+
 OUTPUT_ROOT_DIR_NAME = "anki_audio_output_v3"
 OUTPUT_FILE = "anki_content_v3.json"
 
-# Full mode still outputs every note. These settings only vary how many units
-# Stage 2 generates: a note is "fully suspended" only when all its cards are
-# suspended, so one active direction is enough to retain the normal target.
-FULL_MODE_UNITS_PER_NOTE = 2
-FULL_MODE_UNITS_IF_FULLY_SUSPENDED = 1
-
-# ---------------- Settings used only when SELECTION = True ----------------
-
-# Preserve the 240 unique notes represented by the former 300-row selection
-# (240 unique rows plus 60 repeat rows), but write every source note once.
-SELECTED_NOTE_COUNT = 240
-
-# Stage 2 requests the full-mode active-note baseline for every selected note.
-# The hardest notes receive one additional example. With these defaults,
-# ranks 1-60 request three examples and ranks 61-240 request two: 540 total.
-DIFFICULT_NOTE_COUNT = 60
-SELECTED_UNITS_PER_NOTE = FULL_MODE_UNITS_PER_NOTE
-DIFFICULT_UNITS_PER_NOTE = SELECTED_UNITS_PER_NOTE + 1
-
-# Reviews lose half their recency weight after this many days. A smaller value
-# focuses more sharply on recent study; a larger value remembers longer.
-RECENCY_HALF_LIFE_DAYS = 90.0
+# Used only when SELECTION = False (whole-deck mode). A note counts as fully
+# suspended only when every card belonging to it is suspended.
+FULL_DECK_EXAMPLES_PER_ACTIVE_NOTE = 2
+FULL_DECK_EXAMPLES_PER_SUSPENDED_NOTE = 1
 
 # Old reviews retain this fraction of their weight in mature-lapse and Hard
 # signals. The explicitly recent-Again signal always decays toward zero.
@@ -149,6 +161,7 @@ PREVIEW_NOTES = 3
 PROGRESS_EVERY = 250
 
 # ===================== ADVANCED SETTINGS =====================
+# The ranking details below are already balanced for normal use.
 
 # These convert raw event counts to bounded 0..1 score components.
 RECENT_AGAIN_SATURATION = 2.0
@@ -609,9 +622,9 @@ def extract_notes(
             queue == SUSPENDED_QUEUE for queue in card_queues
         )
         generation_units = (
-            FULL_MODE_UNITS_IF_FULLY_SUSPENDED
+            FULL_DECK_EXAMPLES_PER_SUSPENDED_NOTE
             if all_cards_suspended
-            else FULL_MODE_UNITS_PER_NOTE
+            else FULL_DECK_EXAMPLES_PER_ACTIVE_NOTE
         )
         extracted.append(
             {
@@ -636,7 +649,8 @@ def recency_weight(
 ) -> float:
     """Return exponential half-life weight for a review timestamp."""
     age_days = max(0.0, (reference_ms - review_ms) / 86_400_000.0)
-    decayed = 0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS)
+    half_life_days = RECENCY_FOCUS_MONTHS * 30.0
+    decayed = 0.5 ** (age_days / half_life_days)
     return floor + (1.0 - floor) * decayed
 
 
@@ -998,8 +1012,11 @@ def select_output_notes(
     ranked_notes: Sequence[Dict[str, object]],
 ) -> Tuple[List[Dict[str, object]], int]:
     """Select unique notes and count the hardest three-unit targets."""
-    selected_unique = list(ranked_notes[:SELECTED_NOTE_COUNT])
-    difficult_notes = min(DIFFICULT_NOTE_COUNT, len(selected_unique))
+    selected_unique = list(ranked_notes[:NUMBER_OF_NOTES_TO_SELECT])
+    difficult_notes = min(
+        NUMBER_OF_EXTRA_DIFFICULT_NOTES,
+        len(selected_unique),
+    )
     return selected_unique, difficult_notes
 
 
@@ -1057,9 +1074,9 @@ def make_selected_records(
                 },
                 # Stage 2 honors this optional per-note generation target.
                 "generation_units": (
-                    DIFFICULT_UNITS_PER_NOTE
+                    EXAMPLES_PER_EXTRA_DIFFICULT_NOTE
                     if output_id <= difficult_notes
-                    else SELECTED_UNITS_PER_NOTE
+                    else EXAMPLES_PER_NORMAL_SELECTED_NOTE
                 ),
                 "source_card_ids": [
                     int(card["source_card_id"]) for card in source_cards
@@ -1087,9 +1104,11 @@ def save_results(
             "total_notes": len(notes),
             "sort_order": SORT_ORDER,
             "generation_allocation": {
-                "normal_units_per_note": FULL_MODE_UNITS_PER_NOTE,
+                "normal_units_per_note": (
+                    FULL_DECK_EXAMPLES_PER_ACTIVE_NOTE
+                ),
                 "fully_suspended_units_per_note": (
-                    FULL_MODE_UNITS_IF_FULLY_SUSPENDED
+                    FULL_DECK_EXAMPLES_PER_SUSPENDED_NOTE
                 ),
                 "fully_suspended_notes": sum(
                     bool(note.get("all_cards_suspended")) for note in notes
@@ -1148,11 +1167,18 @@ def save_selected_results(
             "output_order": "unique notes in combined-score order",
             "selection_settings": {
                 "selection": SELECTION,
-                "selected_note_count": SELECTED_NOTE_COUNT,
-                "difficult_note_count": DIFFICULT_NOTE_COUNT,
-                "units_per_selected_note": SELECTED_UNITS_PER_NOTE,
-                "units_per_difficult_note": DIFFICULT_UNITS_PER_NOTE,
-                "recency_half_life_days": RECENCY_HALF_LIFE_DAYS,
+                "selected_note_count": NUMBER_OF_NOTES_TO_SELECT,
+                "difficult_note_count": (
+                    NUMBER_OF_EXTRA_DIFFICULT_NOTES
+                ),
+                "units_per_selected_note": (
+                    EXAMPLES_PER_NORMAL_SELECTED_NOTE
+                ),
+                "units_per_difficult_note": (
+                    EXAMPLES_PER_EXTRA_DIFFICULT_NOTE
+                ),
+                "recency_focus_months": RECENCY_FOCUS_MONTHS,
+                "recency_half_life_days": RECENCY_FOCUS_MONTHS * 30.0,
                 "old_review_weight_floor": OLD_REVIEW_WEIGHT_FLOOR,
                 "smoothing_prior_reviews": SMOOTHING_PRIOR_REVIEWS,
                 "minimum_reviews_per_card": MIN_REVIEWS_PER_CARD,
@@ -1189,49 +1215,71 @@ def validate_configuration() -> None:
             f"Unknown SORT_ORDER: {SORT_ORDER}. Use 'note_id' or 'card_due'."
         )
     unit_settings = {
-        "FULL_MODE_UNITS_PER_NOTE": FULL_MODE_UNITS_PER_NOTE,
-        "FULL_MODE_UNITS_IF_FULLY_SUSPENDED": (
-            FULL_MODE_UNITS_IF_FULLY_SUSPENDED
+        "FULL_DECK_EXAMPLES_PER_ACTIVE_NOTE": (
+            FULL_DECK_EXAMPLES_PER_ACTIVE_NOTE
         ),
-        "SELECTED_UNITS_PER_NOTE": SELECTED_UNITS_PER_NOTE,
-        "DIFFICULT_UNITS_PER_NOTE": DIFFICULT_UNITS_PER_NOTE,
+        "FULL_DECK_EXAMPLES_PER_SUSPENDED_NOTE": (
+            FULL_DECK_EXAMPLES_PER_SUSPENDED_NOTE
+        ),
+        "EXAMPLES_PER_NORMAL_SELECTED_NOTE": (
+            EXAMPLES_PER_NORMAL_SELECTED_NOTE
+        ),
+        "EXAMPLES_PER_EXTRA_DIFFICULT_NOTE": (
+            EXAMPLES_PER_EXTRA_DIFFICULT_NOTE
+        ),
     }
     for setting_name, value in unit_settings.items():
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{setting_name} must be a positive integer")
     if (
-        FULL_MODE_UNITS_IF_FULLY_SUSPENDED
-        > FULL_MODE_UNITS_PER_NOTE
+        FULL_DECK_EXAMPLES_PER_SUSPENDED_NOTE
+        > FULL_DECK_EXAMPLES_PER_ACTIVE_NOTE
     ):
         raise ValueError(
-            "FULL_MODE_UNITS_IF_FULLY_SUSPENDED cannot exceed "
-            "FULL_MODE_UNITS_PER_NOTE"
+            "FULL_DECK_EXAMPLES_PER_SUSPENDED_NOTE cannot exceed "
+            "FULL_DECK_EXAMPLES_PER_ACTIVE_NOTE"
         )
     if not SELECTION:
         return
 
     if (
-        isinstance(SELECTED_NOTE_COUNT, bool)
-        or not isinstance(SELECTED_NOTE_COUNT, int)
+        isinstance(NUMBER_OF_NOTES_TO_SELECT, bool)
+        or not isinstance(NUMBER_OF_NOTES_TO_SELECT, int)
     ):
-        raise ValueError("SELECTED_NOTE_COUNT must be an integer")
-    if SELECTED_NOTE_COUNT < 1:
-        raise ValueError("SELECTED_NOTE_COUNT must be at least 1")
+        raise ValueError("NUMBER_OF_NOTES_TO_SELECT must be an integer")
+    if NUMBER_OF_NOTES_TO_SELECT < 1:
+        raise ValueError("NUMBER_OF_NOTES_TO_SELECT must be at least 1")
     if (
-        isinstance(DIFFICULT_NOTE_COUNT, bool)
-        or not isinstance(DIFFICULT_NOTE_COUNT, int)
+        isinstance(NUMBER_OF_EXTRA_DIFFICULT_NOTES, bool)
+        or not isinstance(NUMBER_OF_EXTRA_DIFFICULT_NOTES, int)
     ):
-        raise ValueError("DIFFICULT_NOTE_COUNT must be an integer")
-    if not 0 <= DIFFICULT_NOTE_COUNT <= SELECTED_NOTE_COUNT:
         raise ValueError(
-            "DIFFICULT_NOTE_COUNT must be between 0 and SELECTED_NOTE_COUNT"
+            "NUMBER_OF_EXTRA_DIFFICULT_NOTES must be an integer"
         )
-    if DIFFICULT_UNITS_PER_NOTE <= SELECTED_UNITS_PER_NOTE:
+    if not (
+        0
+        <= NUMBER_OF_EXTRA_DIFFICULT_NOTES
+        <= NUMBER_OF_NOTES_TO_SELECT
+    ):
         raise ValueError(
-            "DIFFICULT_UNITS_PER_NOTE must exceed SELECTED_UNITS_PER_NOTE"
+            "NUMBER_OF_EXTRA_DIFFICULT_NOTES must be between 0 and "
+            "NUMBER_OF_NOTES_TO_SELECT"
         )
-    if RECENCY_HALF_LIFE_DAYS <= 0:
-        raise ValueError("RECENCY_HALF_LIFE_DAYS must be greater than 0")
+    if (
+        EXAMPLES_PER_EXTRA_DIFFICULT_NOTE
+        <= EXAMPLES_PER_NORMAL_SELECTED_NOTE
+    ):
+        raise ValueError(
+            "EXAMPLES_PER_EXTRA_DIFFICULT_NOTE must exceed "
+            "EXAMPLES_PER_NORMAL_SELECTED_NOTE"
+        )
+    if (
+        isinstance(RECENCY_FOCUS_MONTHS, bool)
+        or not isinstance(RECENCY_FOCUS_MONTHS, (int, float))
+        or not math.isfinite(float(RECENCY_FOCUS_MONTHS))
+        or RECENCY_FOCUS_MONTHS <= 0
+    ):
+        raise ValueError("RECENCY_FOCUS_MONTHS must be greater than 0")
     if not 0 <= OLD_REVIEW_WEIGHT_FLOOR <= 1:
         raise ValueError("OLD_REVIEW_WEIGHT_FLOOR must be between 0 and 1")
     if SMOOTHING_PRIOR_REVIEWS < 0:
@@ -1287,7 +1335,12 @@ def print_summary(notes: List[Dict[str, object]], output_path: Path) -> None:
     print(f"Output file:    {output_path}")
 
     generation_counts = Counter(
-        int(note.get("generation_units", FULL_MODE_UNITS_PER_NOTE))
+        int(
+            note.get(
+                "generation_units",
+                FULL_DECK_EXAMPLES_PER_ACTIVE_NOTE,
+            )
+        )
         for note in notes
     )
     fully_suspended = sum(
@@ -1350,7 +1403,8 @@ def print_selected_summary(
     }
     unique_notes = {int(row["source_note_id"]) for row in unique_records}
     difficult_notes = sum(
-        int(row["generation_units"]) == DIFFICULT_UNITS_PER_NOTE
+        int(row["generation_units"])
+        == EXAMPLES_PER_EXTRA_DIFFICULT_NOTE
         for row in records
     )
     coverage = Counter()
@@ -1384,10 +1438,10 @@ def print_selected_summary(
     for label, count in coverage.most_common():
         print(f"  {label}: {count:,}")
 
-    if len(records) < SELECTED_NOTE_COUNT:
+    if len(records) < NUMBER_OF_NOTES_TO_SELECT:
         print(
-            f"\nWARNING: Requested {SELECTED_NOTE_COUNT:,} unique notes, but only "
-            f"{len(records):,} were eligible."
+            f"\nWARNING: Requested {NUMBER_OF_NOTES_TO_SELECT:,} unique notes, "
+            f"but only {len(records):,} were eligible."
         )
 
     if unique_records and PREVIEW_SELECTED_NOTES > 0:
@@ -1408,10 +1462,11 @@ def print_selected_summary(
     print("\nGENERATION CHECK")
     print(
         f"  First {difficult_notes:,} notes request "
-        f"{DIFFICULT_UNITS_PER_NOTE} examples each"
+        f"{EXAMPLES_PER_EXTRA_DIFFICULT_NOTE} examples each"
     )
     print(
-        f"  Remaining notes request {SELECTED_UNITS_PER_NOTE} examples each"
+        "  Remaining notes request "
+        f"{EXAMPLES_PER_NORMAL_SELECTED_NOTE} examples each"
     )
     print("  Every source note appears once in the extraction")
     print("\nThe JSON is ready for the V3 AI-generation script.")
@@ -1436,13 +1491,20 @@ def main() -> bool:
     print(f"Output folder:  {get_output_root()}")
     print(f"Output:         {output_path}")
     if SELECTION:
-        print(f"Selected notes: {SELECTED_NOTE_COUNT}")
-        print(f"Difficult top:  {DIFFICULT_NOTE_COUNT} notes")
+        print(f"Selected notes: {NUMBER_OF_NOTES_TO_SELECT}")
         print(
-            f"Units per note: {SELECTED_UNITS_PER_NOTE} normal / "
-            f"{DIFFICULT_UNITS_PER_NOTE} difficult"
+            "Extra difficult: "
+            f"{NUMBER_OF_EXTRA_DIFFICULT_NOTES} notes"
         )
-        print(f"Recency:        {RECENCY_HALF_LIFE_DAYS:g}-day half-life")
+        print(
+            "Examples/note:  "
+            f"{EXAMPLES_PER_NORMAL_SELECTED_NOTE} normal / "
+            f"{EXAMPLES_PER_EXTRA_DIFFICULT_NOTE} extra difficult"
+        )
+        print(
+            "Recency focus:  "
+            f"{RECENCY_FOCUS_MONTHS:g} months (half-weight age)"
+        )
         print(
             "Note combine:   "
             f"EN->JP {NOTE_WEIGHT_EN_TO_JP:g}, "
@@ -1451,9 +1513,9 @@ def main() -> bool:
     else:
         print(f"Sort order:     {SORT_ORDER}")
         print(
-            "Units per note: "
-            f"{FULL_MODE_UNITS_PER_NOTE} active / "
-            f"{FULL_MODE_UNITS_IF_FULLY_SUSPENDED} fully suspended"
+            "Examples/note:  "
+            f"{FULL_DECK_EXAMPLES_PER_ACTIVE_NOTE} active / "
+            f"{FULL_DECK_EXAMPLES_PER_SUSPENDED_NOTE} fully suspended"
         )
     print(f"Remove furigana: {REMOVE_FURIGANA}")
     print("=" * 60)
