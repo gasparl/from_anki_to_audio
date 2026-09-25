@@ -9,7 +9,8 @@ beside every finished M4B.
 Each learning unit becomes exactly one M4B chapter with this sequence:
 
   1. Playback number spoken naturally in Japanese with 番目
-  2. Japanese sentence: slow Edge voices, with the chosen target reading
+  2. Japanese sentence: slow Edge voices, with Stage 2's target-specific
+     pronunciation text
   3. Close-structure English translation
   4. Japanese sentence: moderately paced Edge voices
 
@@ -71,7 +72,7 @@ try:
 except ImportError:
     edge_tts = None
 
-SCRIPT_VERSION = "1.0-KANJI-EDGE-JA-HTML-M4B"
+SCRIPT_VERSION = "1.1-KANJI-V1-UNIT-AUDIO"
 
 
 # ===================== ONLY USER SETTING =====================

@@ -7,22 +7,15 @@ generator. Only the V1 learning target is used. V2 fields are deliberately
 ignored.
 
 The deck does not store its intended V1 expression consistently in one field.
-This extractor therefore preserves the useful V1 evidence and also builds a
-candidate list from:
-
-  * Reading (v1)
-  * Example sentence (v1)
-  * Translation (v1)
-  * words
-  * readingExamples
-
-Stage 2 resolves one common modern expression whose focal kanji uses the V1
-reading. A suitable existing V1 sentence may be reused wholly or partly; the
-remaining examples are newly generated.
+This extractor therefore passes only the focal kanji and the three V1 fields
+to Stage 2. Dictionary words, generic reading examples, on/kun lists, keywords,
+JLPT metadata, and V2 material are deliberately ignored. If a V1 note contains
+several expressions, Stage 2 chooses among those V1 expressions only.
 
 In selected mode, ranking uses only the ``JP to EN`` recognition card. That
 card directly measures the requested skill: seeing the kanji and recalling its
 V1 word/reading. EN-to-JP suspension or performance does not distort ranking.
+Any note whose generated cards are all suspended is omitted in every mode.
 
 For modern Anki packages, install the only non-standard dependency with:
     pip install zstandard
@@ -45,7 +38,7 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 
-SCRIPT_VERSION = "1.0-KANJI-V1-RECOGNITION"
+SCRIPT_VERSION = "1.2-KANJI-V1-ONLY"
 
 
 # ==================== QUICK SETTINGS ====================
@@ -90,7 +83,8 @@ OUTPUT_ROOT_DIR_NAME = "kanji_audio_output_v3"
 OUTPUT_FILE = "kanji_content_v3.json"
 
 # Used only when SELECTION = False. A note receives the suspended target only
-# when its JP-to-EN recognition card is suspended. EN-to-JP status is ignored.
+# when its JP-to-EN recognition card is suspended but at least one sibling card
+# remains active. Notes whose cards are all suspended are omitted altogether.
 FULL_DECK_EXAMPLES_PER_ACTIVE_NOTE = 2
 FULL_DECK_EXAMPLES_PER_SUSPENDED_NOTE = 1
 
@@ -117,9 +111,8 @@ WEIGHT_HARD_PRESSES = 0.10
 # Only this recognition template contributes to selection difficulty.
 RECOGNITION_CARD_TEMPLATE = "JP to EN"
 
-# Include suspended cards in selected-mode scoring. False is the sensible
-# default when suspension means "I know this already": a suspended direction
-# is ignored, and a note with no remaining eligible direction is not selected.
+# Include an individually suspended JP-to-EN card in selected-mode scoring.
+# Fully suspended notes are always omitted, regardless of this advanced option.
 INCLUDE_SUSPENDED_CARDS = False
 
 # True: resolve relative paths beside this script.
@@ -132,12 +125,6 @@ KANJI_FIELD = "word"
 V1_READING_FIELD = "Reading (v1)"
 V1_EXAMPLE_FIELD = "Example sentence (v1)"
 V1_TRANSLATION_FIELD = "Translation (v1)"
-WORDS_FIELD = "words"
-READING_EXAMPLES_FIELD = "readingExamples"
-ON_YOMI_FIELD = "onYomi"
-KUN_YOMI_FIELD = "kunYomi"
-KEYWORD_FIELD = "keyword"
-JLPT_FIELD = "jlpt"
 
 # note_id follows the deck's original note/creation order.
 # card_due follows the earliest generated card's Anki due position.
@@ -147,10 +134,6 @@ SORT_ORDER = "note_id"  # "note_id" or "card_due"
 # intended expression and reading. It generates plain Japanese for audio.
 REMOVE_FURIGANA = False
 COMPACT_JAPANESE_SPACES = False
-
-# Candidate evidence is compacted before it is passed to Stage 2. This cap is
-# deliberately generous; most notes have far fewer candidates.
-MAX_EXPRESSION_CANDIDATES = 30
 
 # Console output
 PREVIEW_NOTES = 3
@@ -500,207 +483,17 @@ def get_field(
     return ""
 
 
-KANJI_GLYPH_RE = re.compile(
-    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff々〆ヶヵ]"
-)
-RUBY_TOKEN_RE = re.compile(
-    r"([ぁ-ゖァ-ヺー\u3400-\u4dbf\u4e00-\u9fff"
-    r"\uf900-\ufaff々〆ヶヵ]+)\[([^\]]+)\]"
-)
-DICTIONARY_ENTRY_RE = re.compile(
-    r"([^\s()（）:：,、]+)\(([^()]*)\)\s*[:：]"
-)
-READING_EXAMPLE_RE = re.compile(
-    r"([^\s,、()（）]+)\s*[（(]([^()（）]+)[）)]"
-)
-
-
 def focal_variants(kanji_value: str) -> List[str]:
     """Return accepted focal glyph spellings such as 剥 and 剝."""
     parts = re.split(r"[・･/／,、\s]+", kanji_value or "")
     variants = [part.strip() for part in parts if part.strip()]
     return variants or ([kanji_value.strip()] if kanji_value.strip() else [])
 
-
-def contains_focal(expression: str, variants: Sequence[str]) -> bool:
-    return any(variant and variant in expression for variant in variants)
-
-
-def ruby_candidates(
-    text: str,
-    variants: Sequence[str],
-    source: str,
-) -> List[Dict[str, str]]:
-    """Extract focal ruby runs, joining directly adjacent annotated chunks."""
-    matches = list(RUBY_TOKEN_RE.finditer(text or ""))
-    output: List[Dict[str, str]] = []
-
-    for index, match in enumerate(matches):
-        if not contains_focal(match.group(1), variants):
-            continue
-
-        left = index
-        right = index
-        while left > 0:
-            gap = text[matches[left - 1].end():matches[left].start()]
-            if gap:
-                break
-            left -= 1
-        while right + 1 < len(matches):
-            gap = text[matches[right].end():matches[right + 1].start()]
-            if gap:
-                break
-            right += 1
-
-        expression = "".join(
-            matches[position].group(1)
-            for position in range(left, right + 1)
-        ).strip()
-        reading = "".join(
-            matches[position].group(2).replace(" ", "")
-            for position in range(left, right + 1)
-        ).strip()
-        if expression:
-            output.append(
-                {
-                    "expression": expression,
-                    "reading": reading,
-                    "meaning": "",
-                    "source": source,
-                }
-            )
-
-    return output
-
-
-def dictionary_candidates(
-    text: str,
-    variants: Sequence[str],
-    source: str,
-) -> List[Dict[str, str]]:
-    """Parse concatenated entries such as 技術(ぎじゅつ): technique."""
-    matches = list(DICTIONARY_ENTRY_RE.finditer(text or ""))
-    output: List[Dict[str, str]] = []
-    for index, match in enumerate(matches):
-        expression = match.group(1).strip()
-        if not contains_focal(expression, variants):
-            continue
-        meaning_end = (
-            matches[index + 1].start()
-            if index + 1 < len(matches)
-            else len(text)
-        )
-        meaning = text[match.end():meaning_end].strip(" ;,、。\n")
-        output.append(
-            {
-                "expression": expression,
-                "reading": match.group(2).strip(),
-                "meaning": meaning[:300],
-                "source": source,
-            }
-        )
-    return output
-
-
-def simple_reading_candidates(
-    text: str,
-    variants: Sequence[str],
-    source: str,
-) -> List[Dict[str, str]]:
-    """Extract ``expression (reading)`` items without dictionary meanings."""
-    output: List[Dict[str, str]] = []
-    for match in READING_EXAMPLE_RE.finditer(text or ""):
-        expression = match.group(1).strip()
-        if contains_focal(expression, variants):
-            output.append(
-                {
-                    "expression": expression,
-                    "reading": match.group(2).strip(),
-                    "meaning": "",
-                    "source": source,
-                }
-            )
-    return output
-
-
-def build_expression_candidates(
-    kanji: str,
-    v1_reading: str,
-    v1_example: str,
-    dictionary_words: str,
-    reading_examples: str,
-) -> List[Dict[str, object]]:
-    """Collect evidence without prematurely deciding the intended word."""
-    variants = focal_variants(kanji)
-    candidates: List[Dict[str, str]] = []
-
-    candidates.extend(ruby_candidates(v1_reading, variants, "v1_reading"))
-    candidates.extend(ruby_candidates(v1_example, variants, "v1_example"))
-    candidates.extend(
-        dictionary_candidates(dictionary_words, variants, "dictionary_words")
-    )
-    candidates.extend(
-        simple_reading_candidates(
-            reading_examples,
-            variants,
-            "reading_examples",
-        )
-    )
-
-    # Some Reading (v1) fields name an expression without ruby, for example
-    # ``おじ（叔父: whole-word reading...）`` or ``完璧では ぺき``.
-    for expression in re.findall(
-        r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff々〆ヶヵ]{2,}",
-        v1_reading or "",
-    ):
-        if contains_focal(expression, variants):
-            candidates.append(
-                {
-                    "expression": expression,
-                    "reading": "",
-                    "meaning": "",
-                    "source": "v1_reading",
-                }
-            )
-
-    # Preserve order while merging duplicate evidence from multiple fields.
-    merged: Dict[Tuple[str, str], Dict[str, object]] = {}
-    for candidate in candidates:
-        expression = re.sub(r"\s+", "", candidate["expression"])
-        reading = re.sub(r"\s+", "", candidate["reading"])
-        if not expression or not contains_focal(expression, variants):
-            continue
-        key = (expression, reading)
-        if key not in merged:
-            merged[key] = {
-                "expression": expression,
-                "reading": reading,
-                "meaning": candidate["meaning"],
-                "sources": [candidate["source"]],
-            }
-        else:
-            sources = merged[key]["sources"]
-            if candidate["source"] not in sources:
-                sources.append(candidate["source"])
-            if not merged[key]["meaning"] and candidate["meaning"]:
-                merged[key]["meaning"] = candidate["meaning"]
-
-    if not merged and variants:
-        merged[(variants[0], v1_reading)] = {
-            "expression": variants[0],
-            "reading": v1_reading,
-            "meaning": "",
-            "sources": ["focal_fallback"],
-        }
-
-    return list(merged.values())[:MAX_EXPRESSION_CANDIDATES]
-
-
 def extract_note_content(
     row: sqlite3.Row,
     fields_by_note_type: Dict[int, List[str]],
 ) -> Dict[str, object]:
-    """Extract V1 evidence and candidate expressions from one note row."""
+    """Extract only the focal kanji and the user's V1 curriculum fields."""
     note_type_id = int(row["mid"])
     field_names = fields_by_note_type.get(note_type_id, [])
     field_values = (row["flds"] or "").split(FIELD_SEPARATOR)
@@ -720,27 +513,12 @@ def extract_note_content(
     v1_reading = get_field(fields, V1_READING_FIELD)
     v1_example = get_field(fields, V1_EXAMPLE_FIELD)
     v1_translation = get_field(fields, V1_TRANSLATION_FIELD)
-    dictionary_words = get_field(fields, WORDS_FIELD)
-    reading_examples = get_field(fields, READING_EXAMPLES_FIELD)
     return {
         "kanji": kanji,
         "kanji_variants": focal_variants(kanji),
         "v1_reading": v1_reading,
         "v1_example": v1_example,
         "v1_translation": v1_translation,
-        "dictionary_words": dictionary_words,
-        "reading_examples": reading_examples,
-        "on_yomi": get_field(fields, ON_YOMI_FIELD),
-        "kun_yomi": get_field(fields, KUN_YOMI_FIELD),
-        "keyword": get_field(fields, KEYWORD_FIELD),
-        "jlpt": get_field(fields, JLPT_FIELD),
-        "candidate_expressions": build_expression_candidates(
-            kanji=kanji,
-            v1_reading=v1_reading,
-            v1_example=v1_example,
-            dictionary_words=dictionary_words,
-            reading_examples=reading_examples,
-        ),
     }
 
 
@@ -774,8 +552,6 @@ def warn_missing_configured_fields(
         V1_READING_FIELD,
         V1_EXAMPLE_FIELD,
         V1_TRANSLATION_FIELD,
-        WORDS_FIELD,
-        READING_EXAMPLES_FIELD,
     ]
     for note_type_id in note_type_counts:
         available = {
@@ -807,6 +583,7 @@ def extract_notes(
     rows = get_note_rows(connection)
     note_type_counts = Counter(int(row["mid"]) for row in rows)
     recognition_suspended_by_note: Dict[int, bool] = {}
+    card_queues_by_note: Dict[int, List[int]] = defaultdict(list)
     recognition_name = safe_field_name(RECOGNITION_CARD_TEMPLATE)
     card_query = """
         SELECT c.nid, c.queue, c.ord, n.mid
@@ -814,14 +591,23 @@ def extract_notes(
         JOIN notes AS n ON n.id = c.nid
     """
     for card_row in connection.execute(card_query):
+        note_id = int(card_row["nid"])
+        card_queue = int(card_row["queue"])
+        card_queues_by_note[note_id].append(card_queue)
         template_name = template_names.get(
             (int(card_row["mid"]), int(card_row["ord"])),
             f"Card {int(card_row['ord']) + 1}",
         )
         if safe_field_name(template_name) == recognition_name:
-            recognition_suspended_by_note[int(card_row["nid"])] = (
-                int(card_row["queue"]) == SUSPENDED_QUEUE
+            recognition_suspended_by_note[note_id] = (
+                card_queue == SUSPENDED_QUEUE
             )
+
+    fully_suspended_note_ids = {
+        note_id
+        for note_id, queues in card_queues_by_note.items()
+        if queues and all(queue == SUSPENDED_QUEUE for queue in queues)
+    }
 
     show_note_type_info(
         note_type_names,
@@ -839,8 +625,10 @@ def extract_notes(
 
     extracted: List[Dict[str, object]] = []
 
-    for index, row in enumerate(rows, 1):
+    for scanned_index, row in enumerate(rows, 1):
         note_id = int(row["id"])
+        if note_id in fully_suspended_note_ids:
+            continue
         recognition_suspended = recognition_suspended_by_note.get(
             note_id,
             False,
@@ -852,7 +640,7 @@ def extract_notes(
         )
         extracted.append(
             {
-                "id": index,
+                "id": len(extracted) + 1,
                 "source_note_id": note_id,
                 **extract_note_content(row, fields_by_note_type),
                 "generation_units": generation_units,
@@ -860,8 +648,17 @@ def extract_notes(
             }
         )
 
-        if PROGRESS_EVERY and index % PROGRESS_EVERY == 0:
-            print(f"  Extracted {index:,}/{len(rows):,} notes...")
+        if PROGRESS_EVERY and scanned_index % PROGRESS_EVERY == 0:
+            print(
+                f"  Scanned {scanned_index:,}/{len(rows):,} notes; "
+                f"kept {len(extracted):,}..."
+            )
+
+    if fully_suspended_note_ids:
+        print(
+            "  Fully suspended notes omitted: "
+            f"{len(fully_suspended_note_ids):,}"
+        )
 
     return extracted
 
@@ -904,18 +701,35 @@ def score_cards(
     """Score only eligible JP-to-EN recognition cards."""
     recognition_name = safe_field_name(RECOGNITION_CARD_TEMPLATE)
     recognition_card_ids = set()
+    recognition_note_by_card: Dict[int, int] = {}
+    card_queues_by_note: Dict[int, List[int]] = defaultdict(list)
     card_identity_query = """
-        SELECT c.id AS card_id, c.ord, n.mid
+        SELECT c.id AS card_id, c.nid, c.ord, c.queue, n.mid
         FROM cards AS c
         JOIN notes AS n ON n.id = c.nid
     """
     for card_row in connection.execute(card_identity_query):
+        note_id = int(card_row["nid"])
+        card_queues_by_note[note_id].append(int(card_row["queue"]))
         template_name = template_names.get(
             (int(card_row["mid"]), int(card_row["ord"])),
             f"Card {int(card_row['ord']) + 1}",
         )
         if safe_field_name(template_name) == recognition_name:
-            recognition_card_ids.add(int(card_row["card_id"]))
+            card_id = int(card_row["card_id"])
+            recognition_card_ids.add(card_id)
+            recognition_note_by_card[card_id] = note_id
+
+    fully_suspended_note_ids = {
+        note_id
+        for note_id, queues in card_queues_by_note.items()
+        if queues and all(queue == SUSPENDED_QUEUE for queue in queues)
+    }
+    review_eligible_card_ids = {
+        card_id
+        for card_id in recognition_card_ids
+        if recognition_note_by_card[card_id] not in fully_suspended_note_ids
+    }
 
     histories: Dict[int, List[sqlite3.Row]] = defaultdict(list)
     all_reviews = [
@@ -928,7 +742,7 @@ def score_cards(
             ORDER BY cid, id
             """
         )
-        if int(row["cid"]) in recognition_card_ids
+        if int(row["cid"]) in review_eligible_card_ids
     ]
     for review in all_reviews:
         histories[int(review["cid"])].append(review)
@@ -978,6 +792,10 @@ def score_cards(
         card_id = int(row["card_id"])
         if card_id not in recognition_card_ids:
             excluded["non_recognition_template"] += 1
+            continue
+        note_id = int(row["note_id"])
+        if note_id in fully_suspended_note_ids:
+            excluded["fully_suspended_note"] += 1
             continue
         reviews = histories.get(card_id, [])
         if (
@@ -1061,7 +879,7 @@ def score_cards(
         scored.append(
             {
                 "source_card_id": card_id,
-                "source_note_id": int(row["note_id"]),
+                "source_note_id": note_id,
                 "card_ordinal": card_ordinal,
                 "card_template": template_name,
                 "card_difficulty_score": card_difficulty_score,
@@ -1099,6 +917,7 @@ def score_cards(
             tz=timezone.utc,
         ).isoformat(),
         "normalized_weights": normalized_weights,
+        "fully_suspended_notes_omitted": len(fully_suspended_note_ids),
     }
     return scored, diagnostics
 
@@ -1169,15 +988,6 @@ def aggregate_cards_into_notes(
                 "v1_reading": content_source["v1_reading"],
                 "v1_example": content_source["v1_example"],
                 "v1_translation": content_source["v1_translation"],
-                "dictionary_words": content_source["dictionary_words"],
-                "reading_examples": content_source["reading_examples"],
-                "on_yomi": content_source["on_yomi"],
-                "kun_yomi": content_source["kun_yomi"],
-                "keyword": content_source["keyword"],
-                "jlpt": content_source["jlpt"],
-                "candidate_expressions": content_source[
-                    "candidate_expressions"
-                ],
             }
         )
 
@@ -1252,13 +1062,6 @@ def make_selected_records(
                 "v1_reading": note["v1_reading"],
                 "v1_example": note["v1_example"],
                 "v1_translation": note["v1_translation"],
-                "candidate_expressions": note["candidate_expressions"],
-                "dictionary_words": note["dictionary_words"],
-                "reading_examples": note["reading_examples"],
-                "on_yomi": note["on_yomi"],
-                "kun_yomi": note["kun_yomi"],
-                "keyword": note["keyword"],
-                "jlpt": note["jlpt"],
                 "difficulty_rank": int(note["difficulty_rank"]),
                 "difficulty_score": round(
                     float(note["difficulty_score"]), 8
@@ -1306,9 +1109,10 @@ def save_results(
                 "normal_units_per_note": (
                     FULL_DECK_EXAMPLES_PER_ACTIVE_NOTE
                 ),
-                "fully_suspended_units_per_note": (
+                "recognition_suspended_units_per_note": (
                     FULL_DECK_EXAMPLES_PER_SUSPENDED_NOTE
                 ),
+                "fully_suspended_notes": "omitted",
                 "recognition_suspended_notes": sum(
                     bool(note.get("recognition_card_suspended"))
                     for note in notes
@@ -1319,7 +1123,6 @@ def save_results(
                 "v1_reading",
                 "v1_example",
                 "v1_translation",
-                "candidate_expressions",
             ],
         },
         "notes": notes,
@@ -1383,6 +1186,7 @@ def save_selected_results(
                 "minimum_reviews_per_card": MIN_REVIEWS_PER_CARD,
                 "mature_interval_days": MATURE_INTERVAL_DAYS,
                 "include_suspended_cards": INCLUDE_SUSPENDED_CARDS,
+                "fully_suspended_notes": "always omitted",
                 "card_score_weights": diagnostics["normalized_weights"],
                 "recognition_card_template": RECOGNITION_CARD_TEMPLATE,
             },
@@ -1392,7 +1196,6 @@ def save_selected_results(
                 "v1_reading",
                 "v1_example",
                 "v1_translation",
-                "candidate_expressions",
             ],
         },
         "notes": records,
@@ -1500,14 +1303,6 @@ def validate_configuration() -> None:
         raise ValueError("INCLUDE_SUSPENDED_CARDS must be True or False")
     if not str(RECOGNITION_CARD_TEMPLATE).strip():
         raise ValueError("RECOGNITION_CARD_TEMPLATE cannot be empty")
-    if (
-        isinstance(MAX_EXPRESSION_CANDIDATES, bool)
-        or not isinstance(MAX_EXPRESSION_CANDIDATES, int)
-        or MAX_EXPRESSION_CANDIDATES < 1
-    ):
-        raise ValueError("MAX_EXPRESSION_CANDIDATES must be a positive integer")
-
-
 def print_summary(notes: List[Dict[str, object]], output_path: Path) -> None:
     """Print extraction statistics and a few samples."""
     field_names = [
@@ -1515,7 +1310,6 @@ def print_summary(notes: List[Dict[str, object]], output_path: Path) -> None:
         "v1_reading",
         "v1_example",
         "v1_translation",
-        "candidate_expressions",
     ]
 
     print("\n" + "=" * 60)
@@ -1568,14 +1362,6 @@ def print_summary(notes: List[Dict[str, object]], output_path: Path) -> None:
                 print(f"  V1 example:  {note['v1_example']}")
             if note["v1_translation"]:
                 print(f"  Translation: {note['v1_translation']}")
-            candidates = note.get("candidate_expressions", [])
-            if candidates:
-                preview = ", ".join(
-                    str(candidate.get("expression", ""))
-                    for candidate in candidates[:5]
-                )
-                print(f"  Candidates:  {preview}")
-
     print("\nThe JSON is ready for the V3 AI-generation script.")
     print("=" * 60)
 
@@ -1683,6 +1469,7 @@ def main() -> bool:
             f"{RECENCY_FOCUS_MONTHS:g} months (half-weight age)"
         )
         print(f"Ranking card:   {RECOGNITION_CARD_TEMPLATE}")
+        print("Fully suspended: omitted")
     else:
         print(f"Sort order:     {SORT_ORDER}")
         print(
@@ -1690,6 +1477,7 @@ def main() -> bool:
             f"{FULL_DECK_EXAMPLES_PER_ACTIVE_NOTE} active / "
             f"{FULL_DECK_EXAMPLES_PER_SUSPENDED_NOTE} recognition suspended"
         )
+        print("Fully suspended: omitted")
     print(f"Preserve V1 ruby: {not REMOVE_FURIGANA}")
     print("=" * 60)
 
