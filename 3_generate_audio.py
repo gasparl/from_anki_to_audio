@@ -23,7 +23,9 @@ so TTS work remains resumable while a run is incomplete. Final playback order
 is a deterministic shuffle. The spoken number follows that shuffled playback
 position rather than the internal unit ID. Completed units are packed into
 approximately seven-hour M4B volumes, with an eight-hour ceiling where normal
-unit boundaries permit it. Every volume contains whole units only. After all
+unit boundaries permit it. Each volume also contains at most 255 chapters so
+both M4B chapter formats cover every example. Every volume contains whole
+units only. After all
 M4Bs and HTML companions verify successfully, temporary MP3/cache/build files
 are deleted.
 
@@ -88,7 +90,7 @@ JAPANESE_VOICES = (
 
 # Changing this creates a different deterministic playback order. It does not
 # invalidate generated unit body audio; it only rebuilds audiobook layout.
-SHUFFLE_SEED = 20260920
+SHUFFLE_SEED = 20260925
 
 # ===================== FIXED INTERNAL SETTINGS =====================
 
@@ -170,10 +172,14 @@ VOLUME_DURATION_TOLERANCE_SECONDS = 1.25
 
 # Volumes target seven hours. Full volumes are intended to remain between six
 # and eight hours; the final volume may be shorter when the total cannot divide
-# evenly. A single unusually long unit is never split.
+# evenly. A chapter-limited volume may also be shorter. A single unusually
+# long unit is never split.
 MIN_VOLUME_HOURS = 6.0
 TARGET_VOLUME_HOURS = 7.0
 MAX_VOLUME_HOURS = 8.0
+# The Nero chapter index in M4B holds at most 255 entries. Keep both Nero and
+# QuickTime chapter indexes complete by splitting only between whole units.
+MAX_CHAPTERS_PER_VOLUME = 255
 
 # Cleanup. Keep work files only while a run is incomplete or has failed.
 CLEAN_BUILD_ARTIFACTS_AFTER_SUCCESS = True
@@ -184,6 +190,11 @@ RETRY_BASE_SLEEP = 0.7
 RETRY_JITTER = 0.4
 STOP_AFTER_CONSECUTIVE_FAILURES = 5
 BETWEEN_UNITS_SLEEP = 0.1
+
+# Number-clip progress is printed at the first clip, at this interval, and at
+# completion. Body-phase ETA treats one number clip as one TTS component; the
+# estimate becomes measured directly once number-clip generation begins.
+NUMBER_CLIP_PROGRESS_EVERY = 250
 
 # =========================================================
 
@@ -370,7 +381,7 @@ def format_local_time(moment: datetime) -> str:
 
 def format_eta(
     average_seconds: Optional[float],
-    remaining_items: int,
+    remaining_items: float,
     now: datetime,
 ) -> str:
     if average_seconds is None:
@@ -390,6 +401,51 @@ def format_eta(
 
 def format_unit_id(unit_id: str) -> str:
     return f"{int(unit_id):05d}"
+
+
+def number_clip_output_path(playback_number: int) -> Path:
+    """Return the deterministic output path for one playback number."""
+    return (
+        UNIT_NUMBER_AUDIO_DIR
+        / f"unit_number_{int(playback_number):05d}.mp3"
+    )
+
+
+def count_pending_number_clips(total_units: int) -> int:
+    """Quickly count clips that still appear to need generation."""
+    return sum(
+        not audio_file_is_valid(
+            number_clip_output_path(playback_number),
+            decode=False,
+        )
+        for playback_number in range(1, total_units + 1)
+    )
+
+
+def average_unit_tts_components(
+    plans: Dict[str, Dict],
+    unit_ids: Sequence[str],
+) -> float:
+    """Return the mean TTS-component count in the selected body plans."""
+    component_counts = [
+        sum(len(part.get("components", [])) for part in plans[unit_id]["parts"])
+        for unit_id in unit_ids
+    ]
+    if not component_counts:
+        return 1.0
+    return sum(component_counts) / len(component_counts)
+
+
+def estimated_remaining_unit_equivalents(
+    remaining_units: int,
+    pending_number_clips: int,
+    components_per_unit: float,
+) -> float:
+    """Combine body units and future number clips for a rough overall ETA."""
+    safe_component_count = max(1.0, float(components_per_unit))
+    return max(0, remaining_units) + (
+        max(0, pending_number_clips) / safe_component_count
+    )
 
 
 def validate_and_load_input(path: Path) -> Tuple[Dict[str, Dict], List[str]]:
@@ -607,12 +663,11 @@ def spoken_unit_number(playback_number: int) -> str:
 
 
 def build_number_part(playback_number: int) -> Dict:
-    padded = f"{playback_number:05d}"
     voice_key = unit_number_voice_key(playback_number)
     return {
         "number": 1,
         "name": "playback_unit_number",
-        "output_file": f"unit_number_{padded}.mp3",
+        "output_file": number_clip_output_path(playback_number).name,
         "components": [
             component(
                 spoken_unit_number(playback_number),
@@ -672,6 +727,7 @@ def audiobook_settings() -> Dict:
         "minimum_volume_hours": MIN_VOLUME_HOURS,
         "target_volume_hours": TARGET_VOLUME_HOURS,
         "maximum_volume_hours": MAX_VOLUME_HOURS,
+        "maximum_chapters_per_volume": MAX_CHAPTERS_PER_VOLUME,
         "numbering": "global shuffled playback position spoken with 番目",
         "html_companion": {
             "version": HTML_COMPANION_VERSION,
@@ -1093,19 +1149,26 @@ def save_progress_and_manifest(progress: Dict, manifest: Dict) -> None:
 def ensure_number_parts(
     total_units: int,
     tts_cache: TTSCache,
-) -> Dict[int, Dict]:
+) -> Tuple[Dict[int, Dict], Dict[str, object]]:
     """Create/reuse global shuffled-playback number clips."""
     renderer = PartRenderer(tts_cache)
     metadata: Dict[int, Dict] = {}
     UNIT_NUMBER_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    phase_start = time.perf_counter()
+    built_files = 0
+    reused_files = 0
 
     print("\nPLAYBACK NUMBER AUDIO")
     print("-" * 64)
     for playback_number in range(1, total_units + 1):
         part = build_number_part(playback_number)
         path = UNIT_NUMBER_AUDIO_DIR / part["output_file"]
-        if not audio_file_is_valid(path, decode=True):
+        already_ready = audio_file_is_valid(path, decode=True)
+        if not already_ready:
             renderer.build_part(part, path)
+            built_files += 1
+        else:
+            reused_files += 1
         if not audio_file_is_valid(path, decode=True):
             raise RuntimeError(f"Invalid playback number audio: {path}")
 
@@ -1119,13 +1182,35 @@ def ensure_number_parts(
             "voice": part["components"][0]["voice"],
         }
 
-        if playback_number % 250 == 0 or playback_number == total_units:
+        if (
+            playback_number == 1
+            or playback_number % NUMBER_CLIP_PROGRESS_EVERY == 0
+            or playback_number == total_units
+        ):
+            elapsed = time.perf_counter() - phase_start
+            average_seconds = elapsed / playback_number
+            remaining = total_units - playback_number
+            now = local_now()
             print(
                 f"  Ready: {playback_number:,}/{total_units:,} "
-                "number clips"
+                "number clips | "
+                f"{remaining:,} left | "
+                f"elapsed {format_duration(elapsed)} | "
+                f"ETA {format_eta(average_seconds, remaining, now)}",
+                flush=True,
             )
 
-    return metadata
+    elapsed = time.perf_counter() - phase_start
+    return metadata, {
+        "total_clips": total_units,
+        "built_files": built_files,
+        "reused_files": reused_files,
+        "elapsed_seconds": round(elapsed, 2),
+        "average_seconds_per_clip": round(
+            elapsed / total_units if total_units else 0.0,
+            4,
+        ),
+    }
 
 
 def stable_shuffled_unit_ids(
@@ -1291,6 +1376,7 @@ def split_chapters_into_volumes(chapters: Sequence[Dict]) -> List[List[Dict]]:
         should_cut = bool(current) and (
             current_ms >= target_ms
             or current_ms + duration_ms > max_ms
+            or len(current) >= MAX_CHAPTERS_PER_VOLUME
         )
         if should_cut:
             volumes.append(current)
@@ -1311,7 +1397,12 @@ def split_chapters_into_volumes(chapters: Sequence[Dict]) -> List[List[Dict]]:
         def duration(items: Sequence[Dict]) -> int:
             return sum(int(item["duration_ms"]) for item in items)
 
-        while final and duration(final) < min_ms and previous:
+        while (
+            final
+            and len(final) < MAX_CHAPTERS_PER_VOLUME
+            and duration(final) < min_ms
+            and previous
+        ):
             candidate = previous[-1]
             remaining_previous = duration(previous) - int(
                 candidate["duration_ms"]
@@ -1958,7 +2049,10 @@ def assemble_m4b_volumes(
 ) -> Dict:
     """Build deterministic shuffled multi-volume M4B output."""
     tts_cache = TTSCache(TTS_CACHE_DIR, provider)
-    number_metadata = ensure_number_parts(len(unit_ids), tts_cache)
+    number_metadata, number_phase = ensure_number_parts(
+        len(unit_ids),
+        tts_cache,
+    )
     remove_obsolete_number_files(len(unit_ids))
 
     shuffled_ids = stable_shuffled_unit_ids(unit_ids, units)
@@ -2036,6 +2130,7 @@ def assemble_m4b_volumes(
             "total_volumes": total_volumes,
             "shuffled_unit_ids": shuffled_ids,
             "volumes": output_entries,
+            "number_audio_phase": number_phase,
         }
         save_progress_and_manifest(progress, manifest)
 
@@ -2057,6 +2152,7 @@ def assemble_m4b_volumes(
         "removed_stale_files": removed_stale,
         "number_tts_generated": tts_cache.generated_count,
         "number_tts_reused": tts_cache.reused_count,
+        "number_audio_phase": number_phase,
     }
     save_progress_and_manifest(progress, manifest)
 
@@ -2215,6 +2311,14 @@ def validate_configuration() -> None:
         )
     if MAX_TTS_RETRIES < 1:
         raise ValueError("MAX_TTS_RETRIES must be at least 1")
+    if (
+        isinstance(NUMBER_CLIP_PROGRESS_EVERY, bool)
+        or not isinstance(NUMBER_CLIP_PROGRESS_EVERY, int)
+        or NUMBER_CLIP_PROGRESS_EVERY < 1
+    ):
+        raise ValueError(
+            "NUMBER_CLIP_PROGRESS_EVERY must be a positive integer"
+        )
     if not JAPANESE_VOICES:
         raise ValueError("JAPANESE_VOICES must contain at least one voice")
     if any(
@@ -2260,6 +2364,8 @@ def process_unfinished_units(
     total_units = len(unit_ids)
     already_complete = total_units - len(unfinished_ids)
     completed_running = already_complete
+    pending_number_clips = count_pending_number_clips(total_units)
+    components_per_unit = average_unit_tts_components(plans, unit_ids)
 
     print("\nRUN STATUS")
     print("-" * 64)
@@ -2267,6 +2373,7 @@ def process_unfinished_units(
     print(f"Already complete:      {already_complete:,}")
     print(f"Unfinished before run: {len(unfinished_ids):,}")
     print(f"Selected this run:     {len(selected_ids):,}")
+    print(f"Number clips pending:  {pending_number_clips:,}")
 
     if not selected_ids:
         return {
@@ -2366,12 +2473,18 @@ def process_unfinished_units(
         elapsed_total = time.perf_counter() - run_start
         average_seconds = elapsed_total / attempted_count
         remaining_after = total_units - completed_running
+        remaining_equivalents = estimated_remaining_unit_equivalents(
+            remaining_after,
+            pending_number_clips,
+            components_per_unit,
+        )
         now = local_now()
         print(
             f"  Progress: {completed_running:,}/{total_units:,} complete | "
             f"{remaining_after:,} left | "
             f"elapsed {format_duration(elapsed_total)} | "
-            f"ETA {format_eta(average_seconds, remaining_after, now)}"
+            "ETA "
+            f"{format_eta(average_seconds, remaining_equivalents, now)}"
         )
 
         if consecutive_failures >= STOP_AFTER_CONSECUTIVE_FAILURES:
@@ -2580,6 +2693,17 @@ def main() -> bool:
         print(f"Manifest file:      {MANIFEST_PATH}")
 
         if audiobook_result:
+            number_phase = audiobook_result.get("number_audio_phase", {})
+            if number_phase:
+                print(
+                    "Number clip phase:  "
+                    + format_duration(
+                        float(number_phase.get("elapsed_seconds", 0.0))
+                    )
+                    + " | "
+                    + f"{int(number_phase.get('built_files', 0)):,} built, "
+                    + f"{int(number_phase.get('reused_files', 0)):,} reused"
+                )
             print(
                 f"M4B volumes:        "
                 f"{audiobook_result['total_volumes']:,}"

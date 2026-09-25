@@ -10,8 +10,8 @@ Set ``SELECTION`` in the user settings below:
 * False extracts every Anki note once. Active notes keep the original two
   generated units; fully suspended notes request only one.
 * True scores each card direction from its own review history, combines sibling
-  directions into one weighted score per note, selects the hardest notes, and
-  repeats the hardest notes at the end of the output.
+  directions into one weighted score per note, requests two AI examples per
+  selected note and a third for the hardest notes, without duplicate rows.
 
 Output fields per note:
   id                  = simple sequential number
@@ -21,6 +21,7 @@ Output fields per note:
   explanation         = explanation/grammar note used as private AI context
   example_japanese    = existing Japanese example, if present
   example_english     = existing English example, if present
+  generation_units    = number of new examples requested from the AI
 
 The explanation is retained because it often identifies the exact grammar or
 nuance the learner intended to study. It is passed to the AI as reference
@@ -52,14 +53,14 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 
-SCRIPT_VERSION = "3.4-ADAPTIVE-UNITS"
+SCRIPT_VERSION = "3.6-SELECTION-TWO-PLUS-ONE"
 
 
 # ===================== SIMPLE USER SETTINGS =====================
 
 # False = full-note extraction, with fewer units for fully suspended notes.
 # True  = select difficult notes using combined card-direction histories.
-SELECTION = False
+SELECTION = True
 
 # Put the APKG in the same folder as this script, or enter an absolute path.
 INPUT_FILE = "Base.apkg"
@@ -74,18 +75,16 @@ FULL_MODE_UNITS_IF_FULLY_SUSPENDED = 1
 
 # ---------------- Settings used only when SELECTION = True ----------------
 
-# Total rows written, INCLUDING repeat copies.
-OUTPUT_COUNT = 300
+# Preserve the 240 unique notes represented by the former 300-row selection
+# (240 unique rows plus 60 repeat rows), but write every source note once.
+SELECTED_NOTE_COUNT = 240
 
-# The hardest N notes are included twice. With the defaults, the
-# first 60 rows are their first instances and the last 60 rows are copies;
-# between them are ranks 61-240. Total: 240 unique notes + 60 copies = 300.
-REPEAT_TOP_NOTES = 60
-
-# Stage 2 generates this many learning units for each selected output row.
-# At 1, ranks 1-60 get two units in total because those rows are repeated,
-# while ranks 61-240 get one.
-UNITS_PER_SELECTED_ROW = 1
+# Stage 2 requests the full-mode active-note baseline for every selected note.
+# The hardest notes receive one additional example. With these defaults,
+# ranks 1-60 request three examples and ranks 61-240 request two: 540 total.
+DIFFICULT_NOTE_COUNT = 60
+SELECTED_UNITS_PER_NOTE = FULL_MODE_UNITS_PER_NOTE
+DIFFICULT_UNITS_PER_NOTE = SELECTED_UNITS_PER_NOTE + 1
 
 # Reviews lose half their recency weight after this many days. A smaller value
 # focuses more sharply on recent study; a larger value remembers longer.
@@ -997,17 +996,11 @@ def aggregate_cards_into_notes(
 
 def select_output_notes(
     ranked_notes: Sequence[Dict[str, object]],
-) -> Tuple[List[Tuple[Dict[str, object], int]], int]:
-    """Put unique notes first and second copies of the hardest notes last."""
-    unique_target = OUTPUT_COUNT - REPEAT_TOP_NOTES
-    selected_unique = list(ranked_notes[:unique_target])
-    repeated_count = min(REPEAT_TOP_NOTES, len(selected_unique))
-
-    # This ordering places ranks 1..REPEAT_TOP_NOTES at the beginning, and
-    # their intentional second instances at the very end.
-    selections = [(note, 1) for note in selected_unique]
-    selections.extend((note, 2) for note in selected_unique[:repeated_count])
-    return selections, repeated_count
+) -> Tuple[List[Dict[str, object]], int]:
+    """Select unique notes and count the hardest three-unit targets."""
+    selected_unique = list(ranked_notes[:SELECTED_NOTE_COUNT])
+    difficult_notes = min(DIFFICULT_NOTE_COUNT, len(selected_unique))
+    return selected_unique, difficult_notes
 
 
 def card_audit_record(card: Dict[str, object]) -> Dict[str, object]:
@@ -1031,11 +1024,12 @@ def card_audit_record(card: Dict[str, object]) -> Dict[str, object]:
 
 
 def make_selected_records(
-    selections: Sequence[Tuple[Dict[str, object], int]],
+    selections: Sequence[Dict[str, object]],
+    difficult_notes: int,
 ) -> List[Dict[str, object]]:
     """Create normal pipeline rows plus note-ranking audit fields."""
     records: List[Dict[str, object]] = []
-    for output_id, (note, copy_number) in enumerate(selections, 1):
+    for output_id, note in enumerate(selections, 1):
         source_cards = list(note["source_cards"])
         records.append(
             {
@@ -1052,7 +1046,6 @@ def make_selected_records(
                 "difficulty_score": round(
                     float(note["difficulty_score"]), 8
                 ),
-                "output_copy": copy_number,
                 "aggregation_method": note["aggregation_method"],
                 "direction_scores": {
                     name: round(float(value), 8)
@@ -1062,8 +1055,12 @@ def make_selected_records(
                     name: round(float(value), 8)
                     for name, value in note["combined_components"].items()
                 },
-                # Stage 2 honors this optional per-row generation target.
-                "generation_units": UNITS_PER_SELECTED_ROW,
+                # Stage 2 honors this optional per-note generation target.
+                "generation_units": (
+                    DIFFICULT_UNITS_PER_NOTE
+                    if output_id <= difficult_notes
+                    else SELECTED_UNITS_PER_NOTE
+                ),
                 "source_card_ids": [
                     int(card["source_card_id"]) for card in source_cards
                 ],
@@ -1121,7 +1118,7 @@ def save_selected_results(
     input_path: Path,
     collection_member: str,
     diagnostics: Dict[str, object],
-    repeated_count: int,
+    difficult_notes: int,
 ) -> None:
     """Save selected records with transparent ranking metadata."""
     unique_cards = {
@@ -1139,21 +1136,22 @@ def save_selected_results(
             "total_notes": len(records),
             "unique_contributing_cards": len(unique_cards),
             "unique_source_notes": len(unique_notes),
-            "repeated_notes": repeated_count,
+            "difficult_notes": difficult_notes,
+            "total_requested_units": sum(
+                int(row["generation_units"]) for row in records
+            ),
             "ranked_unit": "Anki note with combined direction scores",
             "ranking_formula": (
                 "weighted mean of independently scored EN-to-JP and "
                 "JP-to-EN cards; unavailable directions contribute zero"
             ),
-            "output_order": (
-                "unique notes in combined-score order, followed by second "
-                "copies of the hardest notes"
-            ),
+            "output_order": "unique notes in combined-score order",
             "selection_settings": {
                 "selection": SELECTION,
-                "output_count_including_repeats": OUTPUT_COUNT,
-                "repeat_top_notes": REPEAT_TOP_NOTES,
-                "units_per_selected_row": UNITS_PER_SELECTED_ROW,
+                "selected_note_count": SELECTED_NOTE_COUNT,
+                "difficult_note_count": DIFFICULT_NOTE_COUNT,
+                "units_per_selected_note": SELECTED_UNITS_PER_NOTE,
+                "units_per_difficult_note": DIFFICULT_UNITS_PER_NOTE,
                 "recency_half_life_days": RECENCY_HALF_LIFE_DAYS,
                 "old_review_weight_floor": OLD_REVIEW_WEIGHT_FLOOR,
                 "smoothing_prior_reviews": SMOOTHING_PRIOR_REVIEWS,
@@ -1195,7 +1193,8 @@ def validate_configuration() -> None:
         "FULL_MODE_UNITS_IF_FULLY_SUSPENDED": (
             FULL_MODE_UNITS_IF_FULLY_SUSPENDED
         ),
-        "UNITS_PER_SELECTED_ROW": UNITS_PER_SELECTED_ROW,
+        "SELECTED_UNITS_PER_NOTE": SELECTED_UNITS_PER_NOTE,
+        "DIFFICULT_UNITS_PER_NOTE": DIFFICULT_UNITS_PER_NOTE,
     }
     for setting_name, value in unit_settings.items():
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -1211,18 +1210,25 @@ def validate_configuration() -> None:
     if not SELECTION:
         return
 
-    if isinstance(OUTPUT_COUNT, bool) or not isinstance(OUTPUT_COUNT, int):
-        raise ValueError("OUTPUT_COUNT must be an integer")
-    if OUTPUT_COUNT < 1:
-        raise ValueError("OUTPUT_COUNT must be at least 1")
     if (
-        isinstance(REPEAT_TOP_NOTES, bool)
-        or not isinstance(REPEAT_TOP_NOTES, int)
+        isinstance(SELECTED_NOTE_COUNT, bool)
+        or not isinstance(SELECTED_NOTE_COUNT, int)
     ):
-        raise ValueError("REPEAT_TOP_NOTES must be an integer")
-    if not 0 <= REPEAT_TOP_NOTES < OUTPUT_COUNT:
+        raise ValueError("SELECTED_NOTE_COUNT must be an integer")
+    if SELECTED_NOTE_COUNT < 1:
+        raise ValueError("SELECTED_NOTE_COUNT must be at least 1")
+    if (
+        isinstance(DIFFICULT_NOTE_COUNT, bool)
+        or not isinstance(DIFFICULT_NOTE_COUNT, int)
+    ):
+        raise ValueError("DIFFICULT_NOTE_COUNT must be an integer")
+    if not 0 <= DIFFICULT_NOTE_COUNT <= SELECTED_NOTE_COUNT:
         raise ValueError(
-            "REPEAT_TOP_NOTES must be between 0 and OUTPUT_COUNT - 1"
+            "DIFFICULT_NOTE_COUNT must be between 0 and SELECTED_NOTE_COUNT"
+        )
+    if DIFFICULT_UNITS_PER_NOTE <= SELECTED_UNITS_PER_NOTE:
+        raise ValueError(
+            "DIFFICULT_UNITS_PER_NOTE must exceed SELECTED_UNITS_PER_NOTE"
         )
     if RECENCY_HALF_LIFE_DAYS <= 0:
         raise ValueError("RECENCY_HALF_LIFE_DAYS must be greater than 0")
@@ -1336,16 +1342,17 @@ def print_selected_summary(
     diagnostics: Dict[str, object],
 ) -> None:
     """Print selected-mode counts and highest-ranked combined notes."""
-    unique_records = [
-        row for row in records if int(row["output_copy"]) == 1
-    ]
+    unique_records = list(records)
     unique_cards = {
         int(card_id)
         for row in unique_records
         for card_id in row["source_card_ids"]
     }
     unique_notes = {int(row["source_note_id"]) for row in unique_records}
-    second_copies = sum(int(row["output_copy"]) == 2 for row in records)
+    difficult_notes = sum(
+        int(row["generation_units"]) == DIFFICULT_UNITS_PER_NOTE
+        for row in records
+    )
     coverage = Counter()
     for row in unique_records:
         directions = set(row["direction_scores"])
@@ -1361,14 +1368,14 @@ def print_selected_summary(
     print("\n" + "=" * 64)
     print("DIFFICULT-NOTE EXTRACTION COMPLETE")
     print("=" * 64)
-    print(f"Output rows:          {len(records):,}")
+    print(f"Output notes:         {len(records):,}")
     print(
         "Stage-2 units:       "
         f"{sum(int(row['generation_units']) for row in records):,}"
     )
     print(f"Unique notes:        {len(unique_notes):,}")
     print(f"Contributing cards:  {len(unique_cards):,}")
-    print(f"Repeated notes:      {second_copies:,}")
+    print(f"Three-unit notes:    {difficult_notes:,}")
     print(f"Notes ranked:        {diagnostics['notes_scored']:,}")
     print(f"Cards scored first:  {diagnostics['cards_scored']:,}")
     print(f"Output file:         {output_path}")
@@ -1377,10 +1384,10 @@ def print_selected_summary(
     for label, count in coverage.most_common():
         print(f"  {label}: {count:,}")
 
-    if len(records) < OUTPUT_COUNT:
+    if len(records) < SELECTED_NOTE_COUNT:
         print(
-            f"\nWARNING: Requested {OUTPUT_COUNT:,} rows, but only "
-            f"{len(records):,} could be produced from eligible notes."
+            f"\nWARNING: Requested {SELECTED_NOTE_COUNT:,} unique notes, but only "
+            f"{len(records):,} were eligible."
         )
 
     if unique_records and PREVIEW_SELECTED_NOTES > 0:
@@ -1398,13 +1405,15 @@ def print_selected_summary(
             )
             print(f"     {record['japanese']} / {record['english']}")
 
-    print("\nORDER CHECK")
+    print("\nGENERATION CHECK")
     print(
-        f"  First {second_copies:,} rows: first instances of the hardest notes"
+        f"  First {difficult_notes:,} notes request "
+        f"{DIFFICULT_UNITS_PER_NOTE} examples each"
     )
     print(
-        f"  Last {second_copies:,} rows: second instances of those same notes"
+        f"  Remaining notes request {SELECTED_UNITS_PER_NOTE} examples each"
     )
+    print("  Every source note appears once in the extraction")
     print("\nThe JSON is ready for the V3 AI-generation script.")
     print("=" * 64)
 
@@ -1427,9 +1436,12 @@ def main() -> bool:
     print(f"Output folder:  {get_output_root()}")
     print(f"Output:         {output_path}")
     if SELECTION:
-        print(f"Output rows:    {OUTPUT_COUNT} (including repeats)")
-        print(f"Repeat top:     {REPEAT_TOP_NOTES} notes")
-        print(f"Units per row:  {UNITS_PER_SELECTED_ROW}")
+        print(f"Selected notes: {SELECTED_NOTE_COUNT}")
+        print(f"Difficult top:  {DIFFICULT_NOTE_COUNT} notes")
+        print(
+            f"Units per note: {SELECTED_UNITS_PER_NOTE} normal / "
+            f"{DIFFICULT_UNITS_PER_NOTE} difficult"
+        )
         print(f"Recency:        {RECENCY_HALF_LIFE_DAYS:g}-day half-life")
         print(
             "Note combine:   "
@@ -1519,10 +1531,10 @@ def main() -> bool:
                         aggregate_cards_into_notes(scored_cards)
                     )
                     diagnostics.update(note_diagnostics)
-                    selections, repeated_count = select_output_notes(
+                    selections, difficult_notes = select_output_notes(
                         ranked_notes
                     )
-                    notes = make_selected_records(selections)
+                    notes = make_selected_records(selections, difficult_notes)
                 else:
                     notes = extract_notes(
                         connection,
@@ -1547,7 +1559,7 @@ def main() -> bool:
                 input_path,
                 collection_member,
                 diagnostics,
-                repeated_count,
+                difficult_notes,
             )
             print_selected_summary(notes, output_path, diagnostics)
         else:

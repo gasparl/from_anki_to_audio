@@ -6,13 +6,13 @@ Reads ``anki_content_v3.json`` created by the V3 extraction script and uses
 DeepSeek to generate fresh Japanese-English learning units.
 
 Full-deck input keeps the original default of two units per active source note.
-The extractor can request a smaller target per row; with the selected-mode
-defaults, each row requests one unit and only the hardest notes receive a second
-unit because they occur again at the end. The model uses the Anki explanation
-to identify the intended grammar or nuance, then recombines that primary point
-with useful supporting material from other notes in the same batch. Existing
-card examples are context only: generated sentences must use new wording and
-situations.
+The extractor sets a generation_units target for each source note. With the
+selected-mode defaults, each unique note requests two units and the hardest
+notes request three distinct units without duplicate input rows. The model uses
+the Anki explanation to identify the intended grammar or nuance, then
+recombines that primary point with useful supporting material from other notes
+in the same batch. Existing card examples are context only: generated
+sentences must use new wording and situations.
 
 The output intentionally contains no explanations, breakdowns, or separate
 literal translations. Each unit contains only:
@@ -55,7 +55,7 @@ except ImportError:
     requests = None
 
 
-SCRIPT_VERSION = "3.1-PER-NOTE-UNITS"
+SCRIPT_VERSION = "3.2-POINT-COVERAGE"
 
 
 # ===================== ONLY USER SETTING =====================
@@ -436,17 +436,19 @@ def build_prompts(
 COVERAGE AND RECOMBINATION:
 1. Use every allowed source note as primary_source_note_number exactly the requested number of times. Required primary counts (note: units): {target_text}.
 2. You can use the primary note's explanation to identify the main words, expressions, grammar points, or nuances being practised.
-3. Create new wording and situations. Use the primary point naturally. There is no need to preserve the old example's content exactly.
-4. Material (words, expressions, grammar) from 0-{MAX_SUPPORTING_NOTES_PER_UNIT} other notes may be used when it fits naturally. Never force unrelated points together; using no supporting notes is fine.
-5. supporting_source_note_numbers must list only other notes genuinely used. Never repeat the primary note there.
+3. When a primary note requests multiple units, first cover different usable main words, senses, grammar points, or nuances from that note. A point counts as covered only when it is central to the Japanese sentence and used correctly.
+4. If the primary note contains only one usable main point, practise it in clearly different natural situations or constructions. Do not invent extra meanings merely to make the units different.
+5. Create new wording and situations. Do not reuse the old example's exact content or make near-paraphrases of it.
+6. Material (words, expressions, grammar) from 0-{MAX_SUPPORTING_NOTES_PER_UNIT} other notes may be used when it fits naturally. Never force unrelated points together; using no supporting notes is fine.
+7. supporting_source_note_numbers must list only other notes genuinely used. Never repeat the primary note there.
 
 LANGUAGE:
 1. Write natural modern Japanese that a native speaker might realistically say, especially in everyday situations, using common words and expressions. Avoid contrived or overloaded phrasing.
 2. Keep each example short: ideally no more than roughly 6-8 words or brief phrase units, unless the grammar point requires more.
-3. Prefer one sentence. Two brief sentences are acceptable when they form a natural pair, such as a question and answer.
-4. When it fits naturally, use wit, humor, gallows humor, irony, or sarcasm. However, natural flow is always more important than the joke.
-5. Vary ordinary casual/plain and ordinary polite です/ます Japanese. Avoid stiff or highly formal language. Vary also wording and vocabulary, do not recycle previous sentences.
-6. This will be read by TTS software, so prefer hiragana or katakana where the reading is ambiguous.
+3. Prefer one sentence. Two brief sentences are occasionally acceptable when they form a natural pair, such as a question and answer.
+4. Try to use wit, humor, irony, sarcasm; be playful and amusing. However, natural flow is always more important.
+5. Across generated units, vary ordinary casual/plain and ordinary polite です/ます Japanese. Avoid stiff or highly formal language. Vary wording and vocabulary; do not recycle previous sentences.
+6. This will be read by TTS software, so prefer hiragana or katakana over kanji (with multiple potential readings) when the surrounding context still makes the intended word boundaries and prosody clear.
 7. The English must faithfully translate the new Japanese and remain very close to its structure, contrasts, conditions, tone, and information flow. It should closely follow the structure of the Japanese version even if somewhat unnatural in English. Nonetheless, the English should be clear and understandable.
 8. The Anki explanation is private reference context only. Do not quote it or include explanations in the output.
 
@@ -465,7 +467,7 @@ Return exactly one JSON object:
 
 All four fields are required in every unit. supporting_source_note_numbers may be an empty array. The only allowed source-note numbers are: {note_numbers}.
 
-Before returning JSON, silently verify the exact total, every required primary count, fresh scenarios, no copied examples, concise native-like natural Japanese with sensible meaning, and faithful close-structure English."""
+Before returning JSON, silently verify the exact total, every required primary count, distinct coverage within each multi-unit primary note, fresh scenarios, no copied examples, concise native-like natural Japanese with sensible meaning, and faithful close-structure English."""
 
     compact_notes = []
     for note in shuffled_prompt_notes(batch):
@@ -485,7 +487,8 @@ Before returning JSON, silently verify the exact total, every required primary c
 
     user_prompt = (
         "Create the requested units from these source notes. Use each Anki "
-        "explanation to pinpoint the intended primary grammar or nuance. The "
+        "explanation to pinpoint and distribute the intended primary words, "
+        "grammar points, senses, or nuances across that note's units. The "
         "explanations are private context and should not appear in the output. "
         "The old examples show usage only and should not be reused as sentence "
         "templates.\n\n"
