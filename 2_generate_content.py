@@ -467,10 +467,10 @@ PLAN FIRST, THEN WRITE:
 2. Each variant plan needs a specific learning_focus, a concrete scenario, and a sentence_design such as a question, request, consequence, contrast, correction, condition, or observation.
 3. Use the explanation to identify the actual words, senses, grammar points, and nuances being practised. When several genuine points are available, distribute them across variants before repeating one. A learning point counts only when it is central to the Japanese sentence and used correctly.
 4. When there is only one genuine point, keep that point but change both the situation and what the speaker is doing with the sentence. A different politeness level, particle ending, or tense alone does not create a distinct variant.
-5. If japanese_point is already a complete sentence, reuse its learning point and structure but do not return the exact sentence unchanged. Changing a meaningful noun, subject, object, detail, setting, or framing is enough. Apply the same rule to the old example.
+5. If japanese_point is already a complete sentence, reuse its learning point and structure but do not return the exact sentence unchanged. You can change, for example, a meaningful noun, subject, object, detail, setting, and framing. Apply the same rule to the old example.
 6. After all plans are complete, write exactly one unit for every planned (primary_source_note_number, variant_number) pair. The sentence must realize its own plan, and sibling units for one primary note must be meaningfully different when heard without the plans.
 
-For example, if the source is 上司から講演会に誘われる, changing only tense or politeness is not enough, but changing 上司 or 講演会, or adding useful framing, can make a valid new example.
+For example, if the source is 上司から講演会に誘われる, 上司から講演会に誘われた and 上司から講演会に誘われました are not distinct variants. Plan different concrete propositions that practise the intended word or pattern in different situations.
 
 SUPPORTING MATERIAL:
 1. Material from 0-{MAX_SUPPORTING_NOTES_PER_UNIT} other notes may be used when it fits naturally. Never force unrelated points together; using no supporting notes is fine.
@@ -515,8 +515,8 @@ Return exactly one JSON object with fields in this order:
 
 Every plan and unit field shown above is required. supporting_source_note_numbers may be an empty array. The only allowed source-note numbers are: {note_numbers}.
 
-Before returning JSON, compare sibling plans and sentences side by side. Rewrite exact duplicates and pairs that differ only in punctuation, particle ending, tense, or politeness. A changed noun, subject, object, time, setting, detail, or useful framing can be enough. Verify the exact counts, unique (primary, variant) pairs, correct central use of each learning focus, natural Japanese, and faithful English."""
-
+Before returning JSON, compare sibling plans and sentences side by side. Rewrite exact duplicates and pairs that differ only in punctuation, minor modifier, tense, or politeness. Verify the exact counts, unique (primary, variant) pairs, fresh propositions, correct central use of each learning focus, natural Japanese, and faithful English."""
+    
     compact_notes = []
     for note in shuffled_prompt_notes(batch):
         compact_notes.append(
