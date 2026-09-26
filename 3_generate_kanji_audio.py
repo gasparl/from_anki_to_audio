@@ -9,15 +9,17 @@ beside every finished M4B.
 Each learning unit becomes exactly one M4B chapter with this sequence:
 
   1. Playback number spoken naturally in Japanese with 番目
-  2. Japanese sentence: slow Edge voices, with Stage 2's target-specific
-     pronunciation text
+  2. Japanese sentence: slow Edge voices, using its normal written form
   3. Close-structure English translation
   4. Japanese sentence: moderately paced Edge voices
 
 There are no explanations, breakdowns, or separate literal translations.
 
-Edge TTS is used for Japanese and English. The two available Japanese neural
-voices rotate deterministically, so reruns and resumes produce the same plan.
+Edge TTS receives the same ordinary Japanese sentence shown to the learner, so
+it can resolve pronunciation from the full context. There is no automatic
+kanji-to-kana replacement. Edge TTS is used for Japanese and English. The two
+available Japanese neural voices rotate deterministically, so reruns and
+resumes produce the same plan.
 
 The Japanese/English body parts are generated and saved per immutable unit ID,
 so TTS work remains resumable while a run is incomplete. Final playback order
@@ -72,7 +74,7 @@ try:
 except ImportError:
     edge_tts = None
 
-SCRIPT_VERSION = "1.1-KANJI-V1-UNIT-AUDIO"
+SCRIPT_VERSION = "1.2-KANJI-DIRECT-TTS"
 
 
 # ===================== ONLY USER SETTING =====================
@@ -493,18 +495,11 @@ def validate_and_load_input(path: Path) -> Tuple[Dict[str, Dict], List[str]]:
             raise ValueError(f"Unit {unit_id} is not an object")
 
         japanese = clean_text(raw_row.get("japanese", ""))
-        japanese_audio = clean_text(
-            raw_row.get("japanese_audio", japanese)
-        )
         english = clean_text(raw_row.get("english", ""))
         if not japanese:
             raise ValueError(f"Unit {unit_id} has empty Japanese")
         if not JAPANESE_RE.search(japanese):
             raise ValueError(f"Unit {unit_id} contains no recognizable Japanese")
-        if not japanese_audio or not JAPANESE_RE.search(japanese_audio):
-            raise ValueError(
-                f"Unit {unit_id} has no usable Japanese audio text"
-            )
         if not english:
             raise ValueError(f"Unit {unit_id} has empty English")
         if JAPANESE_RE.search(english):
@@ -541,7 +536,7 @@ def validate_and_load_input(path: Path) -> Tuple[Dict[str, Dict], List[str]]:
 
         cleaned_row = dict(raw_row)
         cleaned_row["japanese"] = japanese
-        cleaned_row["japanese_audio"] = japanese_audio
+        cleaned_row.pop("japanese_audio", None)
         cleaned_row["english"] = english
         cleaned_row["primary_source_note_number"] = primary_source
         cleaned_row["supporting_source_note_numbers"] = supporting
@@ -585,7 +580,7 @@ def japanese_voice_keys_for_unit(unit_id: str) -> List[str]:
 def build_unit_plan(unit_id: str, row: Dict) -> Dict:
     """Create the durable body plan; shuffled numbering is added at assembly."""
     padded = format_unit_id(unit_id)
-    japanese = clean_text(row.get("japanese_audio", row["japanese"]))
+    japanese = clean_text(row["japanese"])
     english = clean_text(row["english"])
     japanese_voice_keys = japanese_voice_keys_for_unit(unit_id)
 
@@ -1130,7 +1125,6 @@ def update_unit_manifest(
         "updated_at": utc_now(),
         "record_hash": plan["record_hash"],
         "japanese": row["japanese"],
-        "japanese_audio": row.get("japanese_audio", row["japanese"]),
         "english": row["english"],
         "focal_kanji": row.get("focal_kanji", ""),
         "target_word": row.get("target_word", ""),
